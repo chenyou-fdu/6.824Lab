@@ -1,5 +1,14 @@
 package mapreduce
 
+import (
+	"io/ioutil"
+	"encoding/json"
+	"sort"
+	"os"
+	"fmt"
+)
+
+
 // doReduce manages one reduce task: it reads the intermediate
 // key/value pairs (produced by the map phase) for this task, sorts the
 // intermediate key/value pairs by key, calls the user-defined reduce function
@@ -41,6 +50,40 @@ func doReduce(
 	// for key := ... {
 	// 	enc.Encode(KeyValue{key, reduceF(...)})
 	// }
-	// file.Close()
-	//
+	// file.Close()/*
+	all_map := make(map[string][]string)
+	//var all_array []KeyValue
+	for m_idx := 0; m_idx < nMap; m_idx++ {
+		file_name := reduceName(jobName, m_idx, reduceTaskNumber)
+		file_content, _ := ioutil.ReadFile(file_name)
+		var kv_array []KeyValue
+		err := json.Unmarshal(file_content, &kv_array)
+		if err != nil {
+			fmt.Println(file_content)
+			panic(err)
+		}
+		for _, kv_array_v := range kv_array {
+			//all_array = append(all_array, kv_array_v)
+			if _, isFound := all_map[kv_array_v.Key]; isFound == true {
+				all_map[kv_array_v.Key] = append(all_map[kv_array_v.Key], kv_array_v.Value)
+			} else {
+				all_map[kv_array_v.Key] = []string { kv_array_v.Value }
+			}
+		}
+	}
+	var key_slice []string
+	for key, _ := range all_map {
+		key_slice = append(key_slice, key)
+	}
+	sort.Strings(key_slice)
+
+	out_file_name := mergeName(jobName, reduceTaskNumber)
+	out_file, _ := os.OpenFile(out_file_name, os.O_CREATE|os.O_WRONLY, 0)
+	enc := json.NewEncoder(out_file)
+
+	for _, sorted_key := range key_slice {
+		enc.Encode(KeyValue{sorted_key, reduceF(sorted_key, all_map[sorted_key])})
+	}
+	out_file.Close()
 }
+
