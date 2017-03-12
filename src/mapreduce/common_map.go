@@ -66,7 +66,7 @@ func doMap(
 	}
 	for i := 0; i < nReduce; i++ {
 		dest_file_name := reduceName(jobName, mapTaskNumber, i)
-		out_file, _ := os.OpenFile(dest_file_name, os.O_CREATE|os.O_WRONLY, 0)
+		out_file, _ := os.OpenFile(dest_file_name, os.O_CREATE|os.O_WRONLY, 0666)
 		enc := json.NewEncoder(out_file)
 		enc.Encode(temp_res[i])
 		out_file.Close()

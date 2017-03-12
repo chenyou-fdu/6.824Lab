@@ -22,9 +22,8 @@ func schedule(jobName string, mapFiles []string, nReduce int, phase jobPhase, re
 		ntasks = nReduce
 		n_other = len(mapFiles)
 	}
-
 	fmt.Printf("Schedule: %v %v tasks (%d I/Os)\n", ntasks, phase, n_other)
-
+	//fmt.Printf(<-registerChan)
 	// All ntasks tasks have to be scheduled on workers, and only once all of
 	// them have been completed successfully should the function return.
 	// Remember that workers may fail, and that any given worker may finish
@@ -32,5 +31,28 @@ func schedule(jobName string, mapFiles []string, nReduce int, phase jobPhase, re
 	//
 	// TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO
 	//
+	work_name := <-registerChan
+	//done_chan := make(chan int, )
+	for idx, val := range mapFiles {
+		//fmt.Println(i, " ", work_name)
+		//call(work_name, "Worker.DoTask", tmp_arg, nil)
+		s_fun := func() {
+			for {
+				tmp_arg := DoTaskArgs{jobName, val, phase, idx, ntasks}
+				res := call(work_name, "Worker.DoTask", tmp_arg, nil)
+				if res == true {
+					registerChan<-work_name
+					break
+				}
+			}
+		}
+		go s_fun()
+		work_name = <-registerChan
+		if idx == 5 {
+			break
+		}
+	}
+	
 	fmt.Printf("Schedule: %v phase done\n", phase)
+	for {}
 }

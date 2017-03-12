@@ -38,7 +38,6 @@ func (mr *Master) Register(args *RegisterArgs, _ *struct{}) error {
 	defer mr.Unlock()
 	debug("Register: worker %s\n", args.Worker)
 	mr.workers = append(mr.workers, args.Worker)
-
 	// tell forwardRegistrations() that there's a new workers[] entry.
 	mr.newCond.Broadcast()
 
@@ -136,9 +135,7 @@ func (mr *Master) run(jobName string, files []string, nreduce int,
 	mr.jobName = jobName
 	mr.files = files
 	mr.nReduce = nreduce
-
 	fmt.Printf("%s: Starting Map/Reduce task %s\n", mr.address, mr.jobName)
-
 	schedule(mapPhase)
 	schedule(reducePhase)
 	finish()

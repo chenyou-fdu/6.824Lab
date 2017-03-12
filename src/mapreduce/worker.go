@@ -31,7 +31,6 @@ type Worker struct {
 func (wk *Worker) DoTask(arg *DoTaskArgs, _ *struct{}) error {
 	fmt.Printf("%s: given %v task #%d on file %s (nios: %d)\n",
 		wk.name, arg.Phase, arg.TaskNumber, arg.File, arg.NumOtherPhase)
-
 	wk.Lock()
 	wk.nTasks += 1
 	wk.concurrent += 1

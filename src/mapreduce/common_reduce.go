@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"sort"
 	"os"
-	"fmt"
 )
 
 
@@ -59,7 +58,6 @@ func doReduce(
 		var kv_array []KeyValue
 		err := json.Unmarshal(file_content, &kv_array)
 		if err != nil {
-			fmt.Println(file_content)
 			panic(err)
 		}
 		for _, kv_array_v := range kv_array {
@@ -78,7 +76,7 @@ func doReduce(
 	sort.Strings(key_slice)
 
 	out_file_name := mergeName(jobName, reduceTaskNumber)
-	out_file, _ := os.OpenFile(out_file_name, os.O_CREATE|os.O_WRONLY, 0)
+	out_file, _ := os.OpenFile(out_file_name, os.O_CREATE|os.O_WRONLY, 0666)
 	enc := json.NewEncoder(out_file)
 
 	for _, sorted_key := range key_slice {
