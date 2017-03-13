@@ -36,22 +36,23 @@ func schedule(jobName string, mapFiles []string, nReduce int, phase jobPhase, re
 			file_str = mapFiles[idx]
 		}
 		wg.Add(1)
-		s_fun := func(worker_name string, idx int) {
+		s_fun := func(jobName string, file_str string, phase jobPhase, idx int, n_other int) {
 			defer wg.Done()
 			for {
+				worker_name := <-registerChan
 				tmp_arg := DoTaskArgs{jobName, file_str, phase, idx, n_other}
 				res := call(worker_name, "Worker.DoTask", tmp_arg, nil)
+				//fmt.Println(worker_name, " ", res, " ", file_str)
 				// need to start a new goroutine to receive the worker addr
+				go func(worker_name string) {
+					registerChan<-worker_name
+				} (worker_name)
 				if res == true {
-					go func() {
-						registerChan<-worker_name
-					} ()
 					break
 				}
 			}
 		}
-		worker_name := <-registerChan
-		go s_fun(worker_name, idx)
+		go s_fun(jobName, file_str, phase, idx, n_other)
 	}
 	wg.Wait()
 	fmt.Printf("Schedule: %v phase done\n", phase)
