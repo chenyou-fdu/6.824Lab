@@ -42,7 +42,6 @@ func schedule(jobName string, mapFiles []string, nReduce int, phase jobPhase, re
 				worker_name := <-registerChan
 				tmp_arg := DoTaskArgs{jobName, file_str, phase, idx, n_other}
 				res := call(worker_name, "Worker.DoTask", tmp_arg, nil)
-				//fmt.Println(worker_name, " ", res, " ", file_str)
 				// need to start a new goroutine to receive the worker addr
 				go func(worker_name string) {
 					registerChan<-worker_name

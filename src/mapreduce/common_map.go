@@ -5,7 +5,6 @@ import (
 	"io/ioutil"
 	"encoding/json"
 	"os"
-	//"fmt"
 )
 
 // doMap manages one map task: it reads one of the input files
