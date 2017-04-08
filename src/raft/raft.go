@@ -55,6 +55,7 @@ type Raft struct {
     voted_for      int                 // the id of other candidate this raft node has voted for
     
     raft_timer     *time.Timer
+    vote_received  int 
 
     // Look at the paper's Figure 2 for a description of what
     // state a Raft server must maintain.
@@ -64,7 +65,8 @@ type Raft struct {
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
-
+    rf.mu.Lock()
+    defer rf.mu.Unlock()
     var term int
     var isleader bool
     // Your code here (2A).
@@ -127,25 +129,59 @@ func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply)
 }
 
 func (rf *Raft) TimerHandler() {
-    fmt.Println("Time Out My Ass")
+    rf.mu.Lock()
+    fmt.Println("Time Out My Ass")    
     // time out as follower state
-    // start an election as candidate
     if rf.raft_state == 0 {
+        // start an election as candidate
         rf.raft_state = 1
         rf.cur_term++
-
+        rf.vote_received = 1
+        // invoke an election
+        for idx := range rf.peers {
+            if idx == rf.me {
+                continue
+            }
+            rf.mu.Unlock()
+            go func() {
+                rf.mu.Lock()
+                if rf.raft_state != 1 {
+                    return
+                }
+                args := RequestVoteArgs{rf.cur_term, rf.me}
+                reply := RequestVoteReply{-1, false}
+                rf.sendRequestVote(idx, &args, &reply) 
+                if reply.VoteGranted {
+                    rf.vote_received++
+                    if rf.vote_received >= len(rf.peers) / 2 {
+                        // win the election 
+                        rf.raft_state = 2
+                        rf.ResetTimer()
+                    }
+                } else {
+                    if reply.CurrentTerm > rf.cur_term {
+                        rf.cur_term = reply.CurrentTerm
+                        rf.raft_state = 0
+                    }
+                }
+                rf.mu.Unlock()
+            }()
+            rf.mu.Lock()
+        }
+        rf.ResetTimer() 
     } else if rf.raft_state == 1 {
         rf.cur_term++
     }
+    rf.mu.Unlock()
 }
 
-func (rf *Raft) ResetTimer(d time.Duration) {
+func (rf *Raft) ResetTimer() {
     // need to stop the non-timeout timer firstly    
     if(rf.raft_timer != nil) {
         rf.raft_timer.Stop()
     } 
     // restart the timer for next round timeout
-    rf.raft_timer = time.AfterFunc(d, rf.TimerHandler);
+    rf.raft_timer = time.AfterFunc(time.Millisecond * time.Duration(GetRandomTime()), rf.TimerHandler);
 }
 //
 // example RequestVote RPC arguments structure.
@@ -153,7 +189,7 @@ func (rf *Raft) ResetTimer(d time.Duration) {
 //
 type RequestVoteArgs struct {
     // Your data here (2A, 2B).
-    CandidateTerm int  // candidate's term
+    Term int  // candidate's term
     CandidateId int    //
 }
 
@@ -172,6 +208,17 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
     // Your code here (2A, 2B).
+    rf.mu.Lock()
+    defer rf.mu.Unlock()
+    if rf.voted_for == -1 {
+        rf.voted_for = args.CandidateId
+        rf.cur_term = args.Term
+        reply.CurrentTerm = args.Term
+        reply.VoteGranted = true
+    } else if rf.voted_for != -1 || rf.cur_term >= args.Term {
+        reply.CurrentTerm = rf.cur_term
+        reply.VoteGranted = true
+    }
 }
 
 //
@@ -264,6 +311,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
     // starts with term 0 and follower state
     rf.cur_term = 0
     rf.raft_state = 0
+
+    rf.raft_timer = nil
+    rf.voted_for = -1
     // Your initialization code here (2A, 2B, 2C).
     /*for idx := range peers {
         fmt.Println("TestShit",idx)
@@ -275,7 +325,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
     // initialize from state persisted before a crash
     rf.readPersist(persister.ReadRaftState())
 
-    rf.ResetTimer(time.Millisecond * time.Duration(GetRandomTime()))
+    rf.ResetTimer()
 
     return rf
 }
