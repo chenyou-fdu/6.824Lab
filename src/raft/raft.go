@@ -128,60 +128,85 @@ func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply)
     }
 }
 
+func (rf *Raft) ElectionHandler(server int) {
+    fmt.Println(rf.me, "After", rf.mu)
+    //fmt.Println("from", rf.me, "to", server)
+    rf.mu.Lock()
+    if rf.raft_state != 1 {
+        return
+    }
+    args := RequestVoteArgs{rf.cur_term, rf.me}
+    reply := RequestVoteReply{-1, false}
+    rf.mu.Unlock()
+    rf.sendRequestVote(server, &args, &reply)
+    // received peers' vote
+    if reply.VoteGranted {
+        rf.mu.Lock()
+        rf.vote_received++
+        // win the election 
+        if rf.vote_received >= len(rf.peers) / 2 {
+            rf.raft_state = 2
+            // TODO ...
+            rf.mu.Unlock()
+            rf.ResetTimer()
+            rf.mu.Lock()
+        }
+        rf.mu.Unlock()
+    // request vote failed
+    } else {
+        rf.mu.Lock()
+        if reply.CurrentTerm > rf.cur_term {
+            rf.cur_term = reply.CurrentTerm
+            rf.raft_state = 0
+        }
+        rf.mu.Unlock()
+    }
+}
+
 func (rf *Raft) TimerHandler() {
     rf.mu.Lock()
-    fmt.Println("Time Out My Ass")    
+    fmt.Println("Election Time Out ", rf.me)    
     // time out as follower state
     if rf.raft_state == 0 {
-        // start an election as candidate
+        // invoke an election as candidate
         rf.raft_state = 1
         rf.cur_term++
         rf.vote_received = 1
-        // invoke an election
+        rf.mu.Unlock()
+        // send RequestVote to peers in parallel
         for idx := range rf.peers {
             if idx == rf.me {
                 continue
             }
-            rf.mu.Unlock()
-            go func() {
-                rf.mu.Lock()
-                if rf.raft_state != 1 {
-                    return
-                }
-                args := RequestVoteArgs{rf.cur_term, rf.me}
-                reply := RequestVoteReply{-1, false}
-                rf.sendRequestVote(idx, &args, &reply) 
-                if reply.VoteGranted {
-                    rf.vote_received++
-                    if rf.vote_received >= len(rf.peers) / 2 {
-                        // win the election 
-                        rf.raft_state = 2
-                        rf.ResetTimer()
-                    }
-                } else {
-                    if reply.CurrentTerm > rf.cur_term {
-                        rf.cur_term = reply.CurrentTerm
-                        rf.raft_state = 0
-                    }
-                }
-                rf.mu.Unlock()
-            }()
-            rf.mu.Lock()
+            //rf.mu.Unlock()
+            // send out RPC in goroutine
+            fmt.Println(rf.me, "Before", rf.mu)
+            go rf.ElectionHandler(idx)
+            //rf.mu.Lock()
         }
+        //rf.mu.Unlock()
         rf.ResetTimer() 
+        //rf.mu.Lock()
     } else if rf.raft_state == 1 {
         rf.cur_term++
+    } else {
+        rf.mu.Unlock()
     }
-    rf.mu.Unlock()
 }
 
 func (rf *Raft) ResetTimer() {
+    rf.mu.Lock()
+    defer rf.mu.Unlock()
+    //fmt.Println(rf.me, "Reset Timer")
     // need to stop the non-timeout timer firstly    
     if(rf.raft_timer != nil) {
         rf.raft_timer.Stop()
     } 
+    // get random time between 150~300 msec
+    
+    rand_time_num := time.Duration(rand.Intn(150) + 150)
     // restart the timer for next round timeout
-    rf.raft_timer = time.AfterFunc(time.Millisecond * time.Duration(GetRandomTime()), rf.TimerHandler);
+    rf.raft_timer = time.AfterFunc(time.Millisecond * rand_time_num, rf.TimerHandler);
 }
 //
 // example RequestVote RPC arguments structure.
@@ -209,16 +234,22 @@ type RequestVoteReply struct {
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
     // Your code here (2A, 2B).
     rf.mu.Lock()
-    defer rf.mu.Unlock()
+    fmt.Println(rf.me, "Recived", args.CandidateId)
+    // has not voted for other peer or itself
     if rf.voted_for == -1 {
         rf.voted_for = args.CandidateId
         rf.cur_term = args.Term
         reply.CurrentTerm = args.Term
         reply.VoteGranted = true
+        rf.mu.Unlock()
+        rf.ResetTimer()
+        rf.mu.Lock()
+    // has already voted for peer of itself
     } else if rf.voted_for != -1 || rf.cur_term >= args.Term {
         reply.CurrentTerm = rf.cur_term
         reply.VoteGranted = true
     }
+    rf.mu.Unlock()
 }
 
 //
@@ -324,15 +355,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
     // initialize from state persisted before a crash
     rf.readPersist(persister.ReadRaftState())
-
+    rand.Seed(time.Now().UnixNano() + int64(me))  
     rf.ResetTimer()
 
     return rf
 }
 
-// get random time between 150~300 msec
-func GetRandomTime() uint {
-    rand.Seed(time.Now().UnixNano())  
-    rand_time_num := rand.Intn(150) + 150
-    return uint(rand_time_num)
-}
