@@ -111,28 +111,74 @@ func (rf *Raft) readPersist(data []byte) {
 }
 
 type AppendEntriesArgs struct {
-    term int
-    leader_id int
+    Term int
+    LeaderId int
 }
 
 type AppendEntriesReply struct {
-    term int
-    success bool
+    CurrentTerm int
+    Success bool
 }
 
-func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply) {
-    reply.success = true
-    reply.term = rf.cur_term
-    if rf.cur_term < args.term {
-        reply.success = false
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+    rf.mu.Lock()
+    // RPC's Term is no less 
+    if rf.cur_term <= args.Term {
+        fmt.Println(rf.me, "Recived Heartbeat From", args.LeaderId)
+        // recognize the PRC caller's leadership
+        // set reply and current term
+        reply.CurrentTerm = args.Term
+        rf.cur_term = args.Term
+        // conver reciever to follower
+        rf.raft_state = 0
+        reply.Success = true
+        rf.mu.Unlock()
+        // reset election timeout
+        rf.ResetTimer(false)
+        rf.mu.Lock()
+    } else {
+        // RPC's Term is smaller
+        // reject this RPC
+        reply.CurrentTerm = args.Term
+        reply.Success = false
     }
+    rf.mu.Unlock()
+}
+
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+    ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+    return ok
+}
+
+func (rf *Raft) HeartbeatHandler(server int) {
+    rf.mu.Lock()
+    fmt.Println(rf.me, "Send Heartbeat To", server)
+    // check raft state
+    if rf.raft_state != 2 {
+        return
+    }
+    args := AppendEntriesArgs {rf.cur_term, rf.me}
+    reply := AppendEntriesReply {-1, false}
+    rf.mu.Unlock()
+    rf.sendAppendEntries(server, &args, &reply)
+    if reply.Success {
+        // TODO..
+    } else {
+        rf.mu.Lock()
+        if reply.CurrentTerm > rf.cur_term {
+            rf.cur_term = reply.CurrentTerm
+            rf.raft_state = 0
+        }
+        rf.mu.Unlock()
+    }
+
 }
 
 func (rf *Raft) ElectionHandler(server int) {
-    fmt.Println(rf.me, "After", rf.mu)
-    //fmt.Println("from", rf.me, "to", server)
+    // fmt.Println("from", rf.me, "to", server, "in", rf.raft_state)
     rf.mu.Lock()
-    if rf.raft_state != 1 {
+    // check the raft state
+    if rf.raft_state == 2 {
         return
     }
     args := RequestVoteArgs{rf.cur_term, rf.me}
@@ -144,14 +190,23 @@ func (rf *Raft) ElectionHandler(server int) {
         rf.mu.Lock()
         rf.vote_received++
         // win the election 
-        if rf.vote_received >= len(rf.peers) / 2 {
+        if rf.vote_received >= len(rf.peers) / 2 && rf.raft_state == 1{
             rf.raft_state = 2
-            // TODO ...
+            fmt.Println(rf.me, "FUCKING WIN")
+            // reset a heartbeat timer for leader
             rf.mu.Unlock()
-            rf.ResetTimer()
-            rf.mu.Lock()
+            // kick off the initial round of heartbeat PRC
+            for idx := 0; idx < len(rf.peers); idx++ {
+                if idx == rf.me {
+                    continue
+                }
+                go rf.HeartbeatHandler(idx)
+            }
+            rf.ResetTimer(true)
+        } else {
+            // do not win, simply unlock 
+            rf.mu.Unlock()
         }
-        rf.mu.Unlock()
     // request vote failed
     } else {
         rf.mu.Lock()
@@ -165,46 +220,59 @@ func (rf *Raft) ElectionHandler(server int) {
 
 func (rf *Raft) TimerHandler() {
     rf.mu.Lock()
-    fmt.Println("Election Time Out ", rf.me)    
-    // time out as follower state
-    if rf.raft_state == 0 {
-        // invoke an election as candidate
+
+    // time out as follower state or candidate state
+    if rf.raft_state == 0 || rf.raft_state == 1 {
+        fmt.Println("Election Time Out", rf.me)
+        // convert follwer to candidate
         rf.raft_state = 1
+        // increase term
         rf.cur_term++
+        // vote for itself
         rf.vote_received = 1
+        rf.voted_for = rf.me
         rf.mu.Unlock()
+
         // send RequestVote to peers in parallel
-        for idx := range rf.peers {
+        for idx := 0; idx < len(rf.peers); idx++ {
             if idx == rf.me {
                 continue
             }
-            //rf.mu.Unlock()
             // send out RPC in goroutine
-            fmt.Println(rf.me, "Before", rf.mu)
             go rf.ElectionHandler(idx)
-            //rf.mu.Lock()
         }
-        //rf.mu.Unlock()
-        rf.ResetTimer() 
-        //rf.mu.Lock()
-    } else if rf.raft_state == 1 {
-        rf.cur_term++
-    } else {
+        // Set Timer for Election Timeout
+        rf.ResetTimer(false) 
+    } else if rf.raft_state == 2 {
+        // timeout as Leader, send out heart beat PRC
         rf.mu.Unlock()
+        for idx := 0; idx < len(rf.peers); idx++ {
+            if idx == rf.me {
+                continue
+            }
+            go rf.HeartbeatHandler(idx)
+        }
+        rf.ResetTimer(true) 
     }
 }
 
-func (rf *Raft) ResetTimer() {
+func (rf *Raft) ResetTimer(is_heartbeat bool) {
     rf.mu.Lock()
     defer rf.mu.Unlock()
-    //fmt.Println(rf.me, "Reset Timer")
     // need to stop the non-timeout timer firstly    
     if(rf.raft_timer != nil) {
         rf.raft_timer.Stop()
     } 
-    // get random time between 150~300 msec
-    
-    rand_time_num := time.Duration(rand.Intn(150) + 150)
+    var rand_time_num time.Duration
+    if is_heartbeat {
+        // lab restriction, no more than 10 heartbeats per second
+        rand_time_num = time.Duration(150)
+    } else {
+        // election timeout between 550 ~ 700 ms
+        // larger than paper's 150 ~ 300 ms due to lab restriction
+        rand_time_num = time.Duration(rand.Intn(150) + 550)
+        fmt.Println(rf.me, "set timer to", time.Millisecond * rand_time_num)
+    }
     // restart the timer for next round timeout
     rf.raft_timer = time.AfterFunc(time.Millisecond * rand_time_num, rf.TimerHandler);
 }
@@ -234,17 +302,18 @@ type RequestVoteReply struct {
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
     // Your code here (2A, 2B).
     rf.mu.Lock()
-    fmt.Println(rf.me, "Recived", args.CandidateId)
+    // fmt.Println(rf.me, "Recived", args.CandidateId)
     // has not voted for other peer or itself
-    if rf.voted_for == -1 {
+    if rf.voted_for == -1 && rf.cur_term < args.Term {
         rf.voted_for = args.CandidateId
         rf.cur_term = args.Term
         reply.CurrentTerm = args.Term
         reply.VoteGranted = true
+        // reset timer for election timeout
         rf.mu.Unlock()
-        rf.ResetTimer()
+        rf.ResetTimer(false)
         rf.mu.Lock()
-    // has already voted for peer of itself
+    // has already voted for peer of itself or in preceding term
     } else if rf.voted_for != -1 || rf.cur_term >= args.Term {
         reply.CurrentTerm = rf.cur_term
         reply.VoteGranted = true
@@ -355,8 +424,11 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
     // initialize from state persisted before a crash
     rf.readPersist(persister.ReadRaftState())
+
+    // set the seed once for each raft node
     rand.Seed(time.Now().UnixNano() + int64(me))  
-    rf.ResetTimer()
+    // reset timer for inital timeout
+    rf.ResetTimer(false)
 
     return rf
 }
