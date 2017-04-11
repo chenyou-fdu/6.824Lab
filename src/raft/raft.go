@@ -21,9 +21,12 @@ import "sync"
 import "labrpc"
 
 import (
-    "fmt"
+    //"fmt"
     "time"
     "math/rand"
+    "log"
+    "os"
+    "strconv"
 )
 
 // import "bytes"
@@ -57,6 +60,7 @@ type Raft struct {
     raft_timer     *time.Timer
     vote_received  int 
 
+    raft_log       *log.Logger
     // Look at the paper's Figure 2 for a description of what
     // state a Raft server must maintain.
 
@@ -124,7 +128,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
     rf.mu.Lock()
     // RPC's Term is no less 
     if rf.cur_term <= args.Term {
-        fmt.Println(rf.me, "Recived Heartbeat From", args.LeaderId)
+        //fmt.Println(rf.me, "Recived Heartbeat From", args.LeaderId)
         // recognize the PRC caller's leadership
         // set reply and current term
         reply.CurrentTerm = args.Term
@@ -152,7 +156,6 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 
 func (rf *Raft) HeartbeatHandler(server int) {
     rf.mu.Lock()
-    fmt.Println(rf.me, "Send Heartbeat To", server)
     // check raft state
     if rf.raft_state != 2 {
         return
@@ -175,7 +178,6 @@ func (rf *Raft) HeartbeatHandler(server int) {
 }
 
 func (rf *Raft) ElectionHandler(server int) {
-    // fmt.Println("from", rf.me, "to", server, "in", rf.raft_state)
     rf.mu.Lock()
     // check the raft state
     if rf.raft_state == 2 {
@@ -192,7 +194,7 @@ func (rf *Raft) ElectionHandler(server int) {
         // win the election 
         if rf.vote_received >= len(rf.peers) / 2 && rf.raft_state == 1{
             rf.raft_state = 2
-            fmt.Println(rf.me, "FUCKING WIN")
+            rf.raft_log.Println("Win the Election")
             // reset a heartbeat timer for leader
             rf.mu.Unlock()
             // kick off the initial round of heartbeat PRC
@@ -223,7 +225,7 @@ func (rf *Raft) TimerHandler() {
 
     // time out as follower state or candidate state
     if rf.raft_state == 0 || rf.raft_state == 1 {
-        fmt.Println("Election Time Out", rf.me)
+        rf.raft_log.Println("Election Time Out")
         // convert follwer to candidate
         rf.raft_state = 1
         // increase term
@@ -268,10 +270,9 @@ func (rf *Raft) ResetTimer(is_heartbeat bool) {
         // lab restriction, no more than 10 heartbeats per second
         rand_time_num = time.Duration(150)
     } else {
-        // election timeout between 550 ~ 700 ms
+        // election timeout between 250 ~ 400 ms
         // larger than paper's 150 ~ 300 ms due to lab restriction
-        rand_time_num = time.Duration(rand.Intn(150) + 550)
-        fmt.Println(rf.me, "set timer to", time.Millisecond * rand_time_num)
+        rand_time_num = time.Duration(rand.Intn(150) + 250)
     }
     // restart the timer for next round timeout
     rf.raft_timer = time.AfterFunc(time.Millisecond * rand_time_num, rf.TimerHandler);
@@ -302,7 +303,6 @@ type RequestVoteReply struct {
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
     // Your code here (2A, 2B).
     rf.mu.Lock()
-    // fmt.Println(rf.me, "Recived", args.CandidateId)
     // has not voted for other peer or itself
     if rf.voted_for == -1 && rf.cur_term < args.Term {
         rf.voted_for = args.CandidateId
@@ -414,13 +414,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
     rf.raft_timer = nil
     rf.voted_for = -1
+
+    rf.raft_log = log.New(os.Stdout, strconv.Itoa(rf.me) + " Logger: ", log.Lshortfile|log.Lmicroseconds)
+
     // Your initialization code here (2A, 2B, 2C).
-    /*for idx := range peers {
-        fmt.Println("TestShit",idx)
-        //args := AppendEntriesArgs{rf.cur_term, 0}
-        //reply := &AppendEntriesReply{}
-        //peer.Call("Raft.AppendEntries", args, reply)
-    }*/
 
     // initialize from state persisted before a crash
     rf.readPersist(persister.ReadRaftState())
