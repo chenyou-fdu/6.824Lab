@@ -44,6 +44,11 @@ type ApplyMsg struct {
     Snapshot    []byte // ignore for lab2; only used in lab3
 }
 
+type LogEntry struct {
+    Term int
+    Command interface{}
+}
+
 //
 // A Go object implementing a single Raft peer.
 //
@@ -55,12 +60,17 @@ type Raft struct {
     // Your data here (2A, 2B, 2C).
     raft_state     int                 // 0: follower 1: candidate 2: leaders
     cur_term       int                 // current term of this Raft Node
-    voted_for      int                 // the id of other candidate this raft node has voted for
-    
-    raft_timer     *time.Timer
-    vote_received  int 
+    voted_for      int                // the id of other candidate this raft node has voted for
+    log            []*LogEntry
+    vote_received  int   
+    committed_idx  int
+    lastapplied    int
 
-    raft_log       *log.Logger
+    next_idx       []int
+    match_idx      []int
+
+    raft_timer     *time.Timer
+    raft_logger    *log.Logger
     // Look at the paper's Figure 2 for a description of what
     // state a Raft server must maintain.
 
@@ -117,6 +127,10 @@ func (rf *Raft) readPersist(data []byte) {
 type AppendEntriesArgs struct {
     Term int
     LeaderId int
+    PrevLogIndex int
+    PrevLogTerm int
+    Entries[] *LogEntry
+    LeaderCommit int
 }
 
 type AppendEntriesReply struct {
@@ -192,9 +206,9 @@ func (rf *Raft) ElectionHandler(server int) {
         rf.mu.Lock()
         rf.vote_received++
         // win the election 
-        if rf.vote_received >= len(rf.peers) / 2 && rf.raft_state == 1{
+        if rf.vote_received > len(rf.peers) / 2 && rf.raft_state == 1{
             rf.raft_state = 2
-            rf.raft_log.Println("Win the Election")
+            rf.raft_logger.Println("Win the Election", rf.vote_received, "out of", len(rf.peers))
             // reset a heartbeat timer for leader
             rf.mu.Unlock()
             // kick off the initial round of heartbeat PRC
@@ -225,7 +239,7 @@ func (rf *Raft) TimerHandler() {
 
     // time out as follower state or candidate state
     if rf.raft_state == 0 || rf.raft_state == 1 {
-        rf.raft_log.Println("Election Time Out")
+        rf.raft_logger.Println("Election Time Out")
         // convert follwer to candidate
         rf.raft_state = 1
         // increase term
@@ -373,8 +387,20 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
     index := -1
     term := -1
     isLeader := true
-
+    rf.mu.Lock()
+    // to check is raft a leader
+    if rf.raft_state != 2 {
+        isLeader = false
+        rf.mu.Unlock()
+        return index, term, isLeader
+    }
+    // push back new log entry
+    new_log_entry := LogEntry {rf.cur_term, command}
+    rf.log = append(rf.log, &new_log_entry)
+    index = len(rf.log) - 1
+    term = rf.cur_term
     // Your code here (2B).
+    rf.raft_logger.Println("Called", command)
 
 
     return index, term, isLeader
@@ -415,8 +441,13 @@ func Make(peers []*labrpc.ClientEnd, me int,
     rf.raft_timer = nil
     rf.voted_for = -1
 
-    rf.raft_log = log.New(os.Stdout, strconv.Itoa(rf.me) + " Logger: ", log.Lshortfile|log.Lmicroseconds)
+    // log entry index starts with 1, so append a nil pointer here
+    rf.log = append(rf.log, nil)
 
+    rf.raft_logger = log.New(os.Stdout, strconv.Itoa(rf.me) + " Logger: ", log.Lshortfile|log.Lmicroseconds)
+
+    rf.committed_idx = 0
+    rf.lastapplied = 0
     // Your initialization code here (2A, 2B, 2C).
 
     // initialize from state persisted before a crash
