@@ -61,7 +61,7 @@ type Raft struct {
     raft_state     int                 // 0: follower 1: candidate 2: leaders
     cur_term       int                 // current term of this Raft Node
     voted_for      int                // the id of other candidate this raft node has voted for
-    log            []*LogEntry
+    log            []LogEntry
     vote_received  int   
     committed_idx  int
     lastapplied    int
@@ -129,7 +129,7 @@ type AppendEntriesArgs struct {
     LeaderId int
     PrevLogIndex int
     PrevLogTerm int
-    Entries[] *LogEntry
+    Entries []LogEntry
     LeaderCommit int
 }
 
@@ -140,27 +140,47 @@ type AppendEntriesReply struct {
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
     rf.mu.Lock()
-    // RPC's Term is no less 
-    if rf.cur_term <= args.Term {
-        //fmt.Println(rf.me, "Recived Heartbeat From", args.LeaderId)
+    reply.Success = true
+    reply.CurrentTerm = args.Term
+    // Figure 2 Receiver implementation 1
+    if rf.cur_term > args.Term {
+        reply.Success = false
+    // Recieved a HeartBeat, Figure 2 All Servers Rulls 2
+    } else if len(args.Entries) == 0 {
         // recognize the PRC caller's leadership
         // set reply and current term
-        reply.CurrentTerm = args.Term
         rf.cur_term = args.Term
         // conver reciever to follower
         rf.raft_state = 0
-        reply.Success = true
-        rf.mu.Unlock()
-        // reset election timeout
-        rf.ResetTimer(false)
-        rf.mu.Lock()
-    } else {
-        // RPC's Term is smaller
-        // reject this RPC
-        reply.CurrentTerm = args.Term
+    // Figure 2 Receiver implementation 2
+    } else if args.PrevLogIndex - 1 > len(rf.log) - 1 {
         reply.Success = false
+    // Figure 2 Receiver implementation 3
+    } else if rf.log[args.PrevLogIndex - 1].Term != args.PrevLogTerm {
+        reply.Success = false
+        rf.log = rf.log[0 : (args.PrevLogIndex - 1) + 1]
+    } else {
+        // Figure 2 Receiver implementation 4
+        for _, entry := range args.Entries {
+            rf.log = append(rf.log, entry)
+        }
+        // Figure 2 Receiver implementation 5
+        if args.LeaderCommit > rf.committed_idx {
+            if args.LeaderCommit < len(rf.log) {
+                rf.committed_idx = args.LeaderCommit
+            } else {
+                rf.committed_idx = len(rf.log)
+            }
+        }
+        // Figure 2 All Servers Rules 1
+        if rf.committed_idx > rf.lastapplied {
+            // applied? WTF?
+            rf.lastapplied = rf.committed_idx
+        }
     }
+    // reset election timeout
     rf.mu.Unlock()
+    rf.ResetTimer(false)
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
@@ -174,7 +194,25 @@ func (rf *Raft) HeartbeatHandler(server int) {
     if rf.raft_state != 2 {
         return
     }
-    args := AppendEntriesArgs {rf.cur_term, rf.me}
+    // log index starts with 1
+    PrevLogIndex := len(rf.log)
+    var PrevLogTerm int
+    // PrevLogIndex equals 0 means no log here
+    if PrevLogIndex == 0 {
+        PrevLogTerm = 0
+    } else {
+        PrevLogTerm = rf.log[len(rf.log)-2].Term
+    }
+    var send_logs []LogEntry
+    // Figure 2 Leaders Rulls 3
+    // leader have log entries to sent to this follower
+    rf.raft_logger.Println("HeartbeatHandler: Leader Log", rf.log)
+    if len(rf.log) != 0 && len(rf.log) >= rf.next_idx[server] {
+        for idx := rf.next_idx[server]; idx < len(rf.log); idx++ {
+            send_logs = append(send_logs, rf.log[idx])
+        }
+    }
+    args := AppendEntriesArgs {rf.cur_term, rf.me, PrevLogIndex, PrevLogTerm, send_logs, rf.committed_idx}
     reply := AppendEntriesReply {-1, false}
     rf.mu.Unlock()
     rf.sendAppendEntries(server, &args, &reply)
@@ -208,7 +246,10 @@ func (rf *Raft) ElectionHandler(server int) {
         // win the election 
         if rf.vote_received > len(rf.peers) / 2 && rf.raft_state == 1{
             rf.raft_state = 2
-            rf.raft_logger.Println("Win the Election", rf.vote_received, "out of", len(rf.peers))
+            rf.raft_logger.Println("ElectionHandler: Win the Election", rf.vote_received, "out of", len(rf.peers))
+            // reset two log slice
+            rf.match_idx = make([]int, len(rf.peers))
+            rf.next_idx = make([]int, len(rf.peers))
             // reset a heartbeat timer for leader
             rf.mu.Unlock()
             // kick off the initial round of heartbeat PRC
@@ -239,7 +280,7 @@ func (rf *Raft) TimerHandler() {
 
     // time out as follower state or candidate state
     if rf.raft_state == 0 || rf.raft_state == 1 {
-        rf.raft_logger.Println("Election Time Out")
+        rf.raft_logger.Println("TimerHandler: Election Time Out")
         // convert follwer to candidate
         rf.raft_state = 1
         // increase term
@@ -396,13 +437,13 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
     }
     // push back new log entry
     new_log_entry := LogEntry {rf.cur_term, command}
-    rf.log = append(rf.log, &new_log_entry)
+    rf.log = append(rf.log, new_log_entry)
     index = len(rf.log) - 1
     term = rf.cur_term
     // Your code here (2B).
-    rf.raft_logger.Println("Called", command)
+    rf.raft_logger.Println("Start: Called", command)
 
-
+    rf.mu.Unlock()
     return index, term, isLeader
 }
 
@@ -441,13 +482,13 @@ func Make(peers []*labrpc.ClientEnd, me int,
     rf.raft_timer = nil
     rf.voted_for = -1
 
-    // log entry index starts with 1, so append a nil pointer here
-    rf.log = append(rf.log, nil)
+    rf.committed_idx = 0
+    rf.lastapplied = 0
+    rf.match_idx = make([]int, len(peers))
+    rf.next_idx = make([]int, len(peers))
 
     rf.raft_logger = log.New(os.Stdout, strconv.Itoa(rf.me) + " Logger: ", log.Lshortfile|log.Lmicroseconds)
 
-    rf.committed_idx = 0
-    rf.lastapplied = 0
     // Your initialization code here (2A, 2B, 2C).
 
     // initialize from state persisted before a crash
