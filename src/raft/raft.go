@@ -142,9 +142,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
     rf.mu.Lock()
     reply.Success = true
     reply.CurrentTerm = args.Term
-    // Figure 2 Receiver implementation 1
+    // Figure 2 AppendEntries RPC 1 & All Servers Rules 2
     if rf.cur_term > args.Term {
         reply.Success = false
+        rf.raft_state = 0
     // Recieved a HeartBeat, Figure 2 All Servers Rulls 2
     } else if len(args.Entries) == 0 {
         // recognize the PRC caller's leadership
@@ -152,19 +153,19 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
         rf.cur_term = args.Term
         // conver reciever to follower
         rf.raft_state = 0
-    // Figure 2 Receiver implementation 2
+    // Figure 2 AppendEntries RPC 2
     } else if args.PrevLogIndex - 1 > len(rf.log) - 1 {
         reply.Success = false
-    // Figure 2 Receiver implementation 3
+    // Figure 2 AppendEntries RPC 3
     } else if rf.log[args.PrevLogIndex - 1].Term != args.PrevLogTerm {
         reply.Success = false
         rf.log = rf.log[0 : (args.PrevLogIndex - 1) + 1]
     } else {
-        // Figure 2 Receiver implementation 4
+        // Figure 2 AppendEntries RPC 4
         for _, entry := range args.Entries {
             rf.log = append(rf.log, entry)
         }
-        // Figure 2 Receiver implementation 5
+        // Figure 2 AppendEntries RPC 5
         if args.LeaderCommit > rf.committed_idx {
             if args.LeaderCommit < len(rf.log) {
                 rf.committed_idx = args.LeaderCommit
@@ -206,7 +207,7 @@ func (rf *Raft) HeartbeatHandler(server int) {
     var send_logs []LogEntry
     // Figure 2 Leaders Rulls 3
     // leader have log entries to sent to this follower
-    rf.raft_logger.Println("HeartbeatHandler: Leader Log", rf.log)
+    //rf.raft_logger.Println("HeartbeatHandler: Leader Log", rf.log)
     if len(rf.log) != 0 && len(rf.log) >= rf.next_idx[server] {
         for idx := rf.next_idx[server]; idx < len(rf.log); idx++ {
             send_logs = append(send_logs, rf.log[idx])
@@ -358,8 +359,19 @@ type RequestVoteReply struct {
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
     // Your code here (2A, 2B).
     rf.mu.Lock()
-    // has not voted for other peer or itself
-    if rf.voted_for == -1 && rf.cur_term < args.Term {
+    // Figure 2 All Servers Rules 2
+    if args.Term > rf.cur_term {
+        rf.cur_term = args.Term
+        rf.raft_state = 0
+        rf.voted_for = -1
+    }
+    // Figure 2 RequestVote RPC Rules 1
+    if args.Term < rf.cur_term {
+        reply.CurrentTerm = rf.cur_term
+        reply.VoteGranted = false
+    // Figure 2 RequestVote RPC Rules 2 (Partly)
+    } else if rf.voted_for == -1 {
+        // has not voted for other peer or itself
         rf.voted_for = args.CandidateId
         rf.cur_term = args.Term
         reply.CurrentTerm = args.Term
@@ -368,10 +380,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
         rf.mu.Unlock()
         rf.ResetTimer(false)
         rf.mu.Lock()
-    // has already voted for peer of itself or in preceding term
-    } else if rf.voted_for != -1 || rf.cur_term >= args.Term {
+    } else {
         reply.CurrentTerm = rf.cur_term
-        reply.VoteGranted = true
+        reply.VoteGranted = false
     }
     rf.mu.Unlock()
 }
@@ -486,6 +497,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
     rf.lastapplied = 0
     rf.match_idx = make([]int, len(peers))
     rf.next_idx = make([]int, len(peers))
+    for idx := 0; idx < len(peers); idx++ {
+        //rf.match_idx[idx] = 1
+        rf.next_idx[idx] = 1
+    }
 
     rf.raft_logger = log.New(os.Stdout, strconv.Itoa(rf.me) + " Logger: ", log.Lshortfile|log.Lmicroseconds)
 
