@@ -154,12 +154,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
         // conver reciever to follower
         rf.raft_state = 0
     // Figure 2 AppendEntries RPC 2
-    } else if args.PrevLogIndex - 1 > len(rf.log) - 1 {
+    } else if args.PrevLogIndex > len(rf.log) {
         reply.Success = false
-    // Figure 2 AppendEntries RPC 3
-    } else if rf.log[args.PrevLogIndex - 1].Term != args.PrevLogTerm {
+    // Figure 2 AppendEntries RPC 3, check is PrevLogIndex equalls zero for first entry
+    } else if args.PrevLogIndex != 0 && rf.log[args.PrevLogIndex - 1].Term != args.PrevLogTerm {
         reply.Success = false
-        rf.log = rf.log[0 : (args.PrevLogIndex - 1) + 1]
+        rf.log = rf.log[:args.PrevLogIndex - 1]
     } else {
         // Figure 2 AppendEntries RPC 4
         for _, entry := range args.Entries {
@@ -173,7 +173,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
                 rf.committed_idx = len(rf.log)
             }
         }
-        // Figure 2 All Servers Rules 1
+        // Figure 2 All Servers Rules 1, update applied after commit id updated
         if rf.committed_idx > rf.lastapplied {
             // applied? WTF?
             rf.lastapplied = rf.committed_idx
@@ -195,35 +195,43 @@ func (rf *Raft) HeartbeatHandler(server int) {
     if rf.raft_state != 2 {
         return
     }
-    // log index starts with 1
-    PrevLogIndex := len(rf.log)
+
+    PrevLogIndex := rf.next_idx[server]-1
     var PrevLogTerm int
-    // PrevLogIndex equals 0 means no log here
     if PrevLogIndex == 0 {
         PrevLogTerm = 0
     } else {
-        PrevLogTerm = rf.log[len(rf.log)-2].Term
+        PrevLogTerm = rf.log[PrevLogIndex].Term
     }
-    var send_logs []LogEntry
     // Figure 2 Leaders Rulls 3
-    // leader have log entries to sent to this follower
-    //rf.raft_logger.Println("HeartbeatHandler: Leader Log", rf.log)
-    if len(rf.log) != 0 && len(rf.log) >= rf.next_idx[server] {
-        for idx := rf.next_idx[server]; idx < len(rf.log); idx++ {
+    var send_logs []LogEntry
+    if len(rf.log) >= rf.next_idx[server] {
+        for idx := rf.next_idx[server]-1; idx < len(rf.log); idx++ {
             send_logs = append(send_logs, rf.log[idx])
         }
     }
+    //rf.raft_logger.Println("HeartbeatHandler:", send_logs)
     args := AppendEntriesArgs {rf.cur_term, rf.me, PrevLogIndex, PrevLogTerm, send_logs, rf.committed_idx}
     reply := AppendEntriesReply {-1, false}
     rf.mu.Unlock()
     rf.sendAppendEntries(server, &args, &reply)
+    // Figure 2 Leaders Rules 3.1
     if reply.Success {
-        // TODO..
+        rf.mu.Lock()
+        rf.next_idx[server]++
+        // TODO.. unclear here
+        rf.match_idx[server]++
+        rf.mu.Unlock()
     } else {
         rf.mu.Lock()
+        // Figure 2 All Servers Rules 2
         if reply.CurrentTerm > rf.cur_term {
             rf.cur_term = reply.CurrentTerm
             rf.raft_state = 0
+            rf.voted_for = -1
+        // Figure 2 Leaders Rules 3.2
+        } else {
+            rf.next_idx[server]--
         }
         rf.mu.Unlock()
     }
@@ -251,8 +259,14 @@ func (rf *Raft) ElectionHandler(server int) {
             // reset two log slice
             rf.match_idx = make([]int, len(rf.peers))
             rf.next_idx = make([]int, len(rf.peers))
+            for idx := 0; idx < len(rf.peers); idx++ {
+                rf.next_idx[idx] = len(rf.log) + 1
+                // todo after relection
+                rf.match_idx[idx] = 0
+            }
             // reset a heartbeat timer for leader
             rf.mu.Unlock()
+            // Figure 2 Leaders Rulls 1
             // kick off the initial round of heartbeat PRC
             for idx := 0; idx < len(rf.peers); idx++ {
                 if idx == rf.me {
@@ -446,6 +460,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
         rf.mu.Unlock()
         return index, term, isLeader
     }
+    // Figure 2 Leaders Rules 2 Part 1
     // push back new log entry
     new_log_entry := LogEntry {rf.cur_term, command}
     rf.log = append(rf.log, new_log_entry)
@@ -495,11 +510,12 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
     rf.committed_idx = 0
     rf.lastapplied = 0
+
     rf.match_idx = make([]int, len(peers))
     rf.next_idx = make([]int, len(peers))
     for idx := 0; idx < len(peers); idx++ {
-        //rf.match_idx[idx] = 1
-        rf.next_idx[idx] = 1
+        rf.next_idx[idx] = len(rf.log) + 1
+        rf.match_idx[idx] = 0
     }
 
     rf.raft_logger = log.New(os.Stdout, strconv.Itoa(rf.me) + " Logger: ", log.Lshortfile|log.Lmicroseconds)
