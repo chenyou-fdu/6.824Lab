@@ -71,9 +71,18 @@ type Raft struct {
 
     raft_timer     *time.Timer
     raft_logger    *log.Logger
+    raft_applych   *chan ApplyMsg
     // Look at the paper's Figure 2 for a description of what
     // state a Raft server must maintain.
 
+}
+
+func (rf *Raft) ClientFeedback(log_entry LogEntry, idx int) {
+    rf.mu.Lock()
+    apply_msg := ApplyMsg {idx, log_entry.Command, false, nil}
+    *rf.raft_applych <- apply_msg
+    rf.raft_logger.Println("Send Back", apply_msg)
+    rf.mu.Unlock()
 }
 
 // return currentTerm and whether this server
@@ -141,7 +150,7 @@ type AppendEntriesReply struct {
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
     rf.mu.Lock()
     reply.Success = true
-    reply.CurrentTerm = args.Term
+    reply.CurrentTerm = rf.cur_term
     // Figure 2 AppendEntries RPC 1 & All Servers Rules 2
     if rf.cur_term > args.Term {
         reply.Success = false
@@ -178,6 +187,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
             // applied? WTF?
             rf.lastapplied = rf.committed_idx
         }
+        rf.raft_logger.Println("Follower log", rf.log, "commit_idx", rf.committed_idx, "leader_commit_idx", args.LeaderCommit)
     }
     // reset election timeout
     rf.mu.Unlock()
@@ -197,11 +207,12 @@ func (rf *Raft) HeartbeatHandler(server int) {
     }
 
     PrevLogIndex := rf.next_idx[server]-1
+    //rf.raft_logger.Println(rf.next_idx[server], rf.cur_term)
     var PrevLogTerm int
     if PrevLogIndex == 0 {
         PrevLogTerm = 0
     } else {
-        PrevLogTerm = rf.log[PrevLogIndex].Term
+        PrevLogTerm = rf.log[PrevLogIndex-1].Term
     }
     // Figure 2 Leaders Rulls 3
     var send_logs []LogEntry
@@ -210,17 +221,19 @@ func (rf *Raft) HeartbeatHandler(server int) {
             send_logs = append(send_logs, rf.log[idx])
         }
     }
-    //rf.raft_logger.Println("HeartbeatHandler:", send_logs)
     args := AppendEntriesArgs {rf.cur_term, rf.me, PrevLogIndex, PrevLogTerm, send_logs, rf.committed_idx}
     reply := AppendEntriesReply {-1, false}
     rf.mu.Unlock()
-    rf.sendAppendEntries(server, &args, &reply)
+    if !rf.sendAppendEntries(server, &args, &reply) {
+        return
+    }
     // Figure 2 Leaders Rules 3.1
     if reply.Success {
         rf.mu.Lock()
-        rf.next_idx[server]++
-        // TODO.. unclear here
-        rf.match_idx[server]++
+        // use PrevLogIndex is perferred
+        rf.next_idx[server] = PrevLogIndex + len(send_logs) + 1
+        rf.match_idx[server] = PrevLogIndex + len(send_logs)
+        //rf.raft_logger.Println("Reply", reply, rf.match_idx)
         rf.mu.Unlock()
     } else {
         rf.mu.Lock()
@@ -317,6 +330,34 @@ func (rf *Raft) TimerHandler() {
         rf.ResetTimer(false) 
     } else if rf.raft_state == 2 {
         // timeout as Leader, send out heart beat PRC
+        
+
+        // Figure 2 Leader Rulls 4
+        N := rf.committed_idx + 1
+        for N <= len(rf.log) {
+            if rf.log[N-1].Term == rf.cur_term {
+                idx_cnt := 0
+                for each_idx := range rf.match_idx {
+                    if rf.match_idx[each_idx] >= N {
+                        idx_cnt++
+                    }
+                }
+                if idx_cnt > len(rf.peers) / 2 {
+                    rf.raft_logger.Println("Update Committed", N, "in", idx_cnt, "of", len(rf.peers))
+                    rf.committed_idx = N
+                    feedback_log := rf.log[N-1]
+                    rf.mu.Unlock()
+                    go rf.ClientFeedback(feedback_log, N)
+                    rf.mu.Lock()
+                } else {
+                    //rf.raft_logger.Println("Update Failed", N, "in", idx_cnt, "of", len(rf.peers))
+                    break
+                }
+            }
+            N++
+        }
+        rf.lastapplied = rf.committed_idx
+
         rf.mu.Unlock()
         for idx := 0; idx < len(rf.peers); idx++ {
             if idx == rf.me {
@@ -468,7 +509,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
     term = rf.cur_term
     // Your code here (2B).
     rf.raft_logger.Println("Start: Called", command)
-
     rf.mu.Unlock()
     return index, term, isLeader
 }
@@ -529,7 +569,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
     rand.Seed(time.Now().UnixNano() + int64(me))  
     // reset timer for inital timeout
     rf.ResetTimer(false)
-
+    rf.raft_applych = &applyCh
     return rf
 }
 
