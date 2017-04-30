@@ -77,11 +77,12 @@ type Raft struct {
 
 }
 
-func (rf *Raft) ClientFeedback(log_entry LogEntry, idx int) {
+// we need feedbacm the applied message sequential
+func (rf *Raft) ClientFeedback(apply_msg_array []ApplyMsg) {
     rf.mu.Lock()
-    apply_msg := ApplyMsg {idx, log_entry.Command, false, nil}
-    *rf.raft_applych <- apply_msg
-    rf.raft_logger.Println("Send Back", apply_msg)
+    for _, each_apply_msg := range apply_msg_array {
+        *rf.raft_applych <- each_apply_msg
+    }
     rf.mu.Unlock()
 }
 
@@ -151,17 +152,19 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
     rf.mu.Lock()
     reply.Success = true
     reply.CurrentTerm = rf.cur_term
+    rf.raft_logger.Println("Follower Recieved commit_idx", rf.committed_idx, "with args", args)
     // Figure 2 AppendEntries RPC 1 & All Servers Rules 2
-    if rf.cur_term > args.Term {
-        reply.Success = false
-        rf.raft_state = 0
-    // Recieved a HeartBeat, Figure 2 All Servers Rulls 2
-    } else if len(args.Entries) == 0 {
+    if rf.cur_term < args.Term {
         // recognize the PRC caller's leadership
         // set reply and current term
         rf.cur_term = args.Term
         // conver reciever to follower
         rf.raft_state = 0
+    }
+    if rf.cur_term > args.Term {
+        reply.Success = false
+        rf.raft_state = 0
+    // Recieved a HeartBeat, Figure 2 All Servers Rulls 2     
     // Figure 2 AppendEntries RPC 2
     } else if args.PrevLogIndex > len(rf.log) {
         reply.Success = false
@@ -175,6 +178,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
             rf.log = append(rf.log, entry)
         }
         // Figure 2 AppendEntries RPC 5
+        committed_idx_before := rf.committed_idx + 1
         if args.LeaderCommit > rf.committed_idx {
             if args.LeaderCommit < len(rf.log) {
                 rf.committed_idx = args.LeaderCommit
@@ -187,7 +191,17 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
             // applied? WTF?
             rf.lastapplied = rf.committed_idx
         }
-        rf.raft_logger.Println("Follower log", rf.log, "commit_idx", rf.committed_idx, "leader_commit_idx", args.LeaderCommit)
+        // send back newly commited msg
+        if committed_idx_before != 0 && rf.committed_idx != 0 {
+            var apply_msg_array []ApplyMsg
+            for idx := committed_idx_before; idx <= rf.committed_idx; idx++ {
+                each_apply_msg := ApplyMsg {idx, rf.log[idx-1].Command, false, nil}
+                apply_msg_array = append(apply_msg_array, each_apply_msg)
+            }
+            rf.mu.Unlock()
+            go rf.ClientFeedback(apply_msg_array)
+            rf.mu.Lock()
+        }
     }
     // reset election timeout
     rf.mu.Unlock()
@@ -207,7 +221,6 @@ func (rf *Raft) HeartbeatHandler(server int) {
     }
 
     PrevLogIndex := rf.next_idx[server]-1
-    //rf.raft_logger.Println(rf.next_idx[server], rf.cur_term)
     var PrevLogTerm int
     if PrevLogIndex == 0 {
         PrevLogTerm = 0
@@ -223,6 +236,7 @@ func (rf *Raft) HeartbeatHandler(server int) {
     }
     args := AppendEntriesArgs {rf.cur_term, rf.me, PrevLogIndex, PrevLogTerm, send_logs, rf.committed_idx}
     reply := AppendEntriesReply {-1, false}
+    rf.raft_logger.Println("Leader Send To", server, "next", rf.next_idx, "match", rf.match_idx)
     rf.mu.Unlock()
     if !rf.sendAppendEntries(server, &args, &reply) {
         return
@@ -233,7 +247,44 @@ func (rf *Raft) HeartbeatHandler(server int) {
         // use PrevLogIndex is perferred
         rf.next_idx[server] = PrevLogIndex + len(send_logs) + 1
         rf.match_idx[server] = PrevLogIndex + len(send_logs)
-        //rf.raft_logger.Println("Reply", reply, rf.match_idx)
+
+        // Figure 2 Leader Rulls 4
+        committed_idx_before := rf.committed_idx + 1
+        N := rf.committed_idx + 1
+        for N <= len(rf.log) {
+            if rf.log[N-1].Term == rf.cur_term {
+                // include leader itself
+                idx_cnt := 1
+                for each_idx := range rf.match_idx {
+                    if rf.match_idx[each_idx] >= N {
+                        idx_cnt++
+                    }
+                }
+                if idx_cnt > len(rf.peers) / 2 {
+                    rf.raft_logger.Println("Update Committed", N, "in", idx_cnt, "of", len(rf.peers))
+                    rf.committed_idx = N
+                } else {
+                    rf.raft_logger.Println("Update Failed", N, "in", idx_cnt, "of", len(rf.peers))
+                    break
+                }
+            }
+            N++
+        }
+        rf.lastapplied = rf.committed_idx
+
+        if committed_idx_before != 0 && rf.committed_idx != 0 {
+            // send back newly commited msg
+            var apply_msg_array []ApplyMsg
+            for idx := committed_idx_before; idx <= rf.committed_idx; idx++ {
+                each_apply_msg := ApplyMsg {idx, rf.log[idx-1].Command, false, nil}
+                apply_msg_array = append(apply_msg_array, each_apply_msg)
+            }
+            //rf.mu.Unlock()
+            go rf.ClientFeedback(apply_msg_array)
+            //rf.mu.Lock()
+        }
+        //rf.mu.Lock()
+        //rf.raft_logger.Println("Leader Log", rf.log, "next", rf.next_idx, "match", rf.match_idx)
         rf.mu.Unlock()
     } else {
         rf.mu.Lock()
@@ -255,12 +306,64 @@ func (rf *Raft) ElectionHandler(server int) {
     rf.mu.Lock()
     // check the raft state
     if rf.raft_state == 2 {
+        rf.mu.Unlock()
         return
     }
-    args := RequestVoteArgs{rf.cur_term, rf.me}
-    reply := RequestVoteReply{-1, false}
+    args := RequestVoteArgs{
+        Term: rf.cur_term, 
+        CandidateId: rf.me,
+        LastLogIndex: len(rf.log),
+        LastLogTerm: -1}
+    reply := RequestVoteReply{
+        CurrentTerm: -1, 
+        VoteGranted: false}
+    if args.LastLogIndex != 0 {
+        args.LastLogTerm = rf.log[args.LastLogIndex-1].Term
+    }
     rf.mu.Unlock()
-    rf.sendRequestVote(server, &args, &reply)
+    if !rf.sendRequestVote(server, &args, &reply) {
+        return
+    }
+    rf.mu.Lock()
+    // Figure 2 All Servers Rules 2
+    if reply.CurrentTerm > rf.cur_term {
+        rf.cur_term = reply.CurrentTerm
+        rf.raft_state = 0
+        rf.voted_for = -1
+        rf.mu.Unlock()
+        rf.ResetTimer(false)
+        return
+    }
+    if rf.raft_state == 1 && reply.VoteGranted {
+        rf.vote_received++
+        // win the election 
+        if rf.vote_received > len(rf.peers) / 2 {
+            rf.raft_state = 2
+            rf.raft_logger.Println("ElectionHandler: Win the Election", rf.vote_received, "out of", len(rf.peers))
+            // reset two log slice
+            rf.match_idx = make([]int, len(rf.peers))
+            rf.next_idx = make([]int, len(rf.peers))
+            for idx := 0; idx < len(rf.peers); idx++ {
+                rf.next_idx[idx] = len(rf.log) + 1
+                // todo after relection
+                rf.match_idx[idx] = 0
+            }
+            rf.mu.Unlock()
+            // Figure 2 Leaders Rulls 1
+            // kick off the initial round of heartbeat PRC
+            for idx := 0; idx < len(rf.peers); idx++ {
+                    if idx == rf.me {
+                        continue
+                    }
+                    go rf.HeartbeatHandler(idx)
+                }
+            // reset a heartbeat timer for leader
+            rf.ResetTimer(true)
+            rf.mu.Lock()
+        }
+    }
+    rf.mu.Unlock()
+    /*
     // received peers' vote
     if reply.VoteGranted {
         rf.mu.Lock()
@@ -300,7 +403,7 @@ func (rf *Raft) ElectionHandler(server int) {
             rf.raft_state = 0
         }
         rf.mu.Unlock()
-    }
+    }*/
 }
 
 func (rf *Raft) TimerHandler() {
@@ -308,7 +411,7 @@ func (rf *Raft) TimerHandler() {
 
     // time out as follower state or candidate state
     if rf.raft_state == 0 || rf.raft_state == 1 {
-        rf.raft_logger.Println("TimerHandler: Election Time Out")
+        rf.raft_logger.Println("TimerHandler: Election Time Out in term", rf.cur_term)
         // convert follwer to candidate
         rf.raft_state = 1
         // increase term
@@ -330,34 +433,6 @@ func (rf *Raft) TimerHandler() {
         rf.ResetTimer(false) 
     } else if rf.raft_state == 2 {
         // timeout as Leader, send out heart beat PRC
-        
-
-        // Figure 2 Leader Rulls 4
-        N := rf.committed_idx + 1
-        for N <= len(rf.log) {
-            if rf.log[N-1].Term == rf.cur_term {
-                idx_cnt := 0
-                for each_idx := range rf.match_idx {
-                    if rf.match_idx[each_idx] >= N {
-                        idx_cnt++
-                    }
-                }
-                if idx_cnt > len(rf.peers) / 2 {
-                    rf.raft_logger.Println("Update Committed", N, "in", idx_cnt, "of", len(rf.peers))
-                    rf.committed_idx = N
-                    feedback_log := rf.log[N-1]
-                    rf.mu.Unlock()
-                    go rf.ClientFeedback(feedback_log, N)
-                    rf.mu.Lock()
-                } else {
-                    //rf.raft_logger.Println("Update Failed", N, "in", idx_cnt, "of", len(rf.peers))
-                    break
-                }
-            }
-            N++
-        }
-        rf.lastapplied = rf.committed_idx
-
         rf.mu.Unlock()
         for idx := 0; idx < len(rf.peers); idx++ {
             if idx == rf.me {
@@ -379,7 +454,7 @@ func (rf *Raft) ResetTimer(is_heartbeat bool) {
     var rand_time_num time.Duration
     if is_heartbeat {
         // lab restriction, no more than 10 heartbeats per second
-        rand_time_num = time.Duration(150)
+        rand_time_num = time.Duration(120)
     } else {
         // election timeout between 250 ~ 400 ms
         // larger than paper's 150 ~ 300 ms due to lab restriction
@@ -395,7 +470,9 @@ func (rf *Raft) ResetTimer(is_heartbeat bool) {
 type RequestVoteArgs struct {
     // Your data here (2A, 2B).
     Term int  // candidate's term
-    CandidateId int    //
+    CandidateId int    
+    LastLogIndex int
+    LastLogTerm int
 }
 
 //
@@ -414,6 +491,11 @@ type RequestVoteReply struct {
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
     // Your code here (2A, 2B).
     rf.mu.Lock()
+    last_log_index := len(rf.log)
+    last_log_term := -1
+    if last_log_index != 0 {
+        last_log_term = rf.log[last_log_index-1].Term
+    }
     // Figure 2 All Servers Rules 2
     if args.Term > rf.cur_term {
         rf.cur_term = args.Term
@@ -424,8 +506,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
     if args.Term < rf.cur_term {
         reply.CurrentTerm = rf.cur_term
         reply.VoteGranted = false
-    // Figure 2 RequestVote RPC Rules 2 (Partly)
-    } else if rf.voted_for == -1 {
+    // Figure 2 RequestVote RPC Rules 2
+    } else if rf.voted_for == -1 && (args.LastLogTerm >= last_log_term || (args.LastLogTerm == last_log_term && args.LastLogIndex >= last_log_index)) {
         // has not voted for other peer or itself
         rf.voted_for = args.CandidateId
         rf.cur_term = args.Term
@@ -505,10 +587,10 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
     // push back new log entry
     new_log_entry := LogEntry {rf.cur_term, command}
     rf.log = append(rf.log, new_log_entry)
-    index = len(rf.log) - 1
+    index = len(rf.log)
     term = rf.cur_term
     // Your code here (2B).
-    rf.raft_logger.Println("Start: Called", command)
+    rf.raft_logger.Println("Start: Called", command, "in term", rf.cur_term)
     rf.mu.Unlock()
     return index, term, isLeader
 }
@@ -559,7 +641,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
     }
 
     rf.raft_logger = log.New(os.Stdout, strconv.Itoa(rf.me) + " Logger: ", log.Lshortfile|log.Lmicroseconds)
-
     // Your initialization code here (2A, 2B, 2C).
 
     // initialize from state persisted before a crash
