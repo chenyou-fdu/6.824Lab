@@ -21,12 +21,13 @@ import "sync"
 import "labrpc"
 
 import (
-    //"fmt"
+    "fmt"
     "time"
     "math/rand"
     "log"
-    "os"
-    "strconv"
+    "sort"
+    //"os"
+    //"strconv"
 )
 
 // import "bytes"
@@ -53,37 +54,86 @@ type LogEntry struct {
 // A Go object implementing a single Raft peer.
 //
 type Raft struct {
-    mu             sync.Mutex          // Lock to protect shared access to this peer's state
-    peers          []*labrpc.ClientEnd // RPC end points of all peers
-    persister      *Persister          // Object to hold this peer's persisted state
-    me             int                 // this peer's index into peers[]
+    mu                  sync.Mutex          // Lock to protect shared access to this peer's state
+    peers               []*labrpc.ClientEnd // RPC end points of all peers
+    persister           *Persister          // Object to hold this peer's persisted state
+    me                  int                 // this peer's index into peers[]
     // Your data here (2A, 2B, 2C).
-    raft_state     int                 // 0: follower 1: candidate 2: leaders
-    cur_term       int                 // current term of this Raft Node
-    voted_for      int                // the id of other candidate this raft node has voted for
-    log            []LogEntry
-    vote_received  int   
-    committed_idx  int
-    lastapplied    int
+    cur_state           int                 // 0: follower 1: candidate 2: leaders
+    cur_term            int                 // current term of this Raft Node
+    voted_for           int                // the id of other candidate this raft node has voted for
+    log                 []LogEntry
+    vote_received       int   
+    committed_idx       int
+    last_applied_idx    int
 
-    next_idx       []int
-    match_idx      []int
-
-    raft_timer     *time.Timer
-    raft_logger    *log.Logger
-    raft_applych   *chan ApplyMsg
+    next_idx            []int
+    match_idx           []int
+     
+    raft_timer          *time.Timer
+    raft_logger         *log.Logger
+    raft_apply_ch       chan ApplyMsg
+    raft_applied_sigal  chan bool
     // Look at the paper's Figure 2 for a description of what
     // state a Raft server must maintain.
 
 }
 
-// we need feedbacm the applied message sequential
-func (rf *Raft) ClientFeedback(apply_msg_array []ApplyMsg) {
-    rf.mu.Lock()
-    for _, each_apply_msg := range apply_msg_array {
-        *rf.raft_applych <- each_apply_msg
+// functions for timer
+func GetRandomTime(raft_state int) time.Duration {
+    var rand_time_num time.Duration
+    if raft_state == 2 {
+        // lab restriction, no more than 10 heartbeats per second
+        rand_time_num = time.Duration(120)
+    } else {
+        // election timeout between 250 ~ 400 ms
+        // larger than paper's 150 ~ 300 ms due to lab restriction
+        rand_time_num = time.Duration(rand.Intn(150) + 250)
     }
-    rf.mu.Unlock()
+    return rand_time_num * time.Millisecond
+}
+
+func (rf *Raft) NodeTimer() {
+    for {
+        <-rf.raft_timer.C
+        rf.mu.Lock()
+        if rf.cur_state == 2 {
+            // send out HeartBeats
+            go rf.BoardcastHeartbeat()
+        } else {
+            // start election
+            go rf.BroadcastElection()
+        }
+        rf.raft_timer.Reset(GetRandomTime(rf.cur_state))
+        rf.mu.Unlock()
+    }
+}
+// need to hold lock for this function
+func (rf *Raft) ResetTimer(raft_state int) {
+    if !rf.raft_timer.Stop() {
+        <-rf.raft_timer.C
+    }
+    rf.raft_timer.Reset(GetRandomTime(raft_state))
+}
+
+// function for applied msg 
+// we need feedbacm the applied message sequential
+func (rf *Raft) ApplyMessage() {
+    for {
+        <-rf.raft_applied_sigal
+        rf.mu.Lock()
+        logs_to_applied := rf.log[(rf.last_applied_idx - 1) + 1 : rf.committed_idx]
+        old_applied_idx := rf.last_applied_idx
+        //DPrintf(fmt.Sprintf("%v: logs_to_applied %v", rf.me, logs_to_applied))
+        if rf.committed_idx > rf.last_applied_idx {
+            rf.last_applied_idx = rf.committed_idx
+        }
+        rf.mu.Unlock()
+        for i := 0; i < len(logs_to_applied); i++ {
+            message := ApplyMsg {old_applied_idx + 1 + i, logs_to_applied[i].Command, false, nil}
+            rf.raft_apply_ch <- message
+        }
+    }
 }
 
 // return currentTerm and whether this server
@@ -94,10 +144,10 @@ func (rf *Raft) GetState() (int, bool) {
     var term int
     var isleader bool
     // Your code here (2A).
-    if rf.raft_state == 0 || rf.raft_state == 1 {
-        isleader = false
-    } else {
+    if rf.cur_state == 2 {
         isleader = true
+    } else {
+        isleader = false
     }
     term = rf.cur_term
     return term, isleader
@@ -144,325 +194,183 @@ type AppendEntriesArgs struct {
 }
 
 type AppendEntriesReply struct {
-    CurrentTerm int
+    ConflictTerm int
+    ConflictIndex int
+    Term int
     Success bool
+}
+
+func (rf *Raft) BoardcastHeartbeat() {
+    rf.mu.Lock()
+    if rf.cur_state != 2 {
+        rf.mu.Unlock()
+        return
+    }
+    for i := 0; i < len(rf.peers); i++ {
+        if i == rf.me {
+            continue
+        }
+        prev_log_index := rf.next_idx[i] - 1
+        prev_log_term := -1
+        if prev_log_index > 0 {
+            prev_log_term = rf.log[prev_log_index-1].Term
+        }
+        args := AppendEntriesArgs {
+            Term: rf.cur_term,
+            LeaderId: rf.me,
+            PrevLogIndex: prev_log_index,
+            PrevLogTerm: prev_log_term,
+            Entries: rf.log[rf.next_idx[i]-1:],
+            LeaderCommit: rf.committed_idx }
+        go rf.HeartbeatSender(i, args)
+    }
+    rf.mu.Unlock()
+}
+
+func (rf *Raft) HeartbeatSender(server_idx int, args AppendEntriesArgs) {
+    //DPrintf(fmt.Sprintf("%v: Send Out heartbeats to %v next %v match %v", rf.me, server_idx, rf.next_idx, rf.match_idx))
+    DPrintf(fmt.Sprintf("%v: Send Out heartbeats to %v log %v", rf.me, server_idx, rf.log))
+    reply := AppendEntriesReply {-1, -1, -1, false}
+    is_ok := rf.sendAppendEntries(server_idx, &args, &reply)
+    rf.mu.Lock()
+    if rf.cur_term == args.Term && is_ok {
+        if reply.Success {
+            if args.PrevLogIndex + len(args.Entries) > rf.match_idx[server_idx] {
+                rf.next_idx[server_idx] = args.PrevLogIndex + len(args.Entries) + 1
+                rf.match_idx[server_idx] = args.PrevLogIndex + len(args.Entries)
+                if args.PrevLogIndex + len(args.Entries) > rf.committed_idx {
+                    go rf.CheckPeerCommitIdx()
+                }
+            }
+        } else {
+            // Figure 2 All Servers Rules 2
+            if rf.cur_term < reply.Term {
+                rf.cur_state = 0
+                rf.cur_term = reply.Term
+                rf.voted_for = -1
+            } else {
+                DPrintf(fmt.Sprintf("%v: Conflict %v", rf.me, reply))
+                /*prev_log_index := -1
+                
+                for i := args.PrevLogIndex - 1; i >= 0; i-- {
+                    if rf.log[i].Term == reply.ConflictTerm {
+                        prev_log_index = i+1
+                        break
+                    }
+                }
+                if prev_log_index > 0 && rf.log[prev_log_index-1].Term != reply.ConflictTerm {
+                    prev_log_index = reply.ConflictIndex - 1
+                }*/
+                rf.next_idx[server_idx]--
+                prev_log_index := rf.next_idx[server_idx] - 1 
+                
+                prev_log_term := -1
+                if prev_log_index > 0 {
+                    prev_log_term = rf.log[prev_log_index-1].Term
+                }
+                retry_args := AppendEntriesArgs {
+                    Term: rf.cur_term,
+                    LeaderId: rf.me,
+                    PrevLogIndex: prev_log_index,
+                    PrevLogTerm: prev_log_term,
+                    //Entries: rf.log[args.PrevLogIndex+1-1:],
+                    Entries: rf.log[rf.next_idx[server_idx]-1:],
+                    LeaderCommit: rf.committed_idx }
+                go rf.HeartbeatSender(server_idx, retry_args)
+            }
+        }
+    }
+    rf.mu.Unlock()
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
     rf.mu.Lock()
-    reply.Success = true
-    reply.CurrentTerm = rf.cur_term
-    rf.raft_logger.Println("Follower Recieved commit_idx", rf.committed_idx, "with args", args)
-    // Figure 2 AppendEntries RPC 1 & All Servers Rules 2
-    if rf.cur_term < args.Term {
-        // recognize the PRC caller's leadership
-        // set reply and current term
-        rf.cur_term = args.Term
-        // conver reciever to follower
-        rf.raft_state = 0
-    }
-    if rf.cur_term > args.Term {
+    DPrintf(fmt.Sprintf("%v: Receive heartbeat with %v log %v", rf.me, args, rf.log))
+    reply.Term = rf.cur_term
+
+    // Figure 2 AppendEntries RPC 1
+    if args.Term < rf.cur_term {
         reply.Success = false
-        rf.raft_state = 0
-    // Recieved a HeartBeat, Figure 2 All Servers Rulls 2     
-    // Figure 2 AppendEntries RPC 2
-    } else if args.PrevLogIndex > len(rf.log) {
-        reply.Success = false
-    // Figure 2 AppendEntries RPC 3, check is PrevLogIndex equalls zero for first entry
-    } else if args.PrevLogIndex != 0 && rf.log[args.PrevLogIndex - 1].Term != args.PrevLogTerm {
-        reply.Success = false
-        rf.log = rf.log[:args.PrevLogIndex - 1]
     } else {
-        // Figure 2 AppendEntries RPC 4
-        for _, entry := range args.Entries {
-            rf.log = append(rf.log, entry)
+        rf.cur_state = 0
+        rf.ResetTimer(rf.cur_state)
+        // Figure 2 All Servers Rules 2
+        if rf.cur_term < args.Term {
+            rf.voted_for = -1
+            rf.cur_term = args.Term
         }
-        // Figure 2 AppendEntries RPC 5
-        committed_idx_before := rf.committed_idx + 1
-        if args.LeaderCommit > rf.committed_idx {
-            if args.LeaderCommit < len(rf.log) {
-                rf.committed_idx = args.LeaderCommit
-            } else {
-                rf.committed_idx = len(rf.log)
+        // Figure 2 AppendEntries RPC 2
+        if args.PrevLogIndex > len(rf.log) {
+            reply.Success = false
+            reply.ConflictTerm = -1
+            reply.ConflictIndex = len(rf.log) + 1
+        // Figure 2 AppendEntries RPC 3, check is PrevLogIndex equalls zero for first entry
+        } else if args.PrevLogIndex > 0 && args.PrevLogTerm != rf.log[args.PrevLogIndex-1].Term {
+            reply.Success = false
+            reply.ConflictTerm = rf.log[args.PrevLogIndex-1].Term
+            reply.ConflictIndex = args.PrevLogIndex
+            for reply.ConflictIndex > 0 && rf.log[reply.ConflictIndex - 1].Term == reply.ConflictTerm {
+                reply.ConflictIndex--
             }
-        }
-        // Figure 2 All Servers Rules 1, update applied after commit id updated
-        if rf.committed_idx > rf.lastapplied {
-            // applied? WTF?
-            rf.lastapplied = rf.committed_idx
-        }
-        // send back newly commited msg
-        if committed_idx_before != 0 && rf.committed_idx != 0 {
-            var apply_msg_array []ApplyMsg
-            for idx := committed_idx_before; idx <= rf.committed_idx; idx++ {
-                each_apply_msg := ApplyMsg {idx, rf.log[idx-1].Command, false, nil}
-                apply_msg_array = append(apply_msg_array, each_apply_msg)
+        } else {
+            reply.Success = true
+            entry_start_idx := 0
+            // Figure 2 AppendEntries RPC 3
+            if len(args.Entries) > 0 {
+                for i := args.PrevLogIndex + 1 - 1; i >= 0 && i < len(rf.log) && entry_start_idx < len(args.Entries); i++{
+                    if rf.log[i].Term != args.Entries[entry_start_idx].Term {
+                        rf.log = rf.log[:i]
+                        break
+                    }
+                    entry_start_idx++
+                }
+                // Figure 2 AppendEntries RPC 4
+                for i := entry_start_idx; i < len(args.Entries); i++ {
+                    rf.log = append(rf.log, args.Entries[i])
+                }
             }
-            rf.mu.Unlock()
-            go rf.ClientFeedback(apply_msg_array)
-            rf.mu.Lock()
+            // Figure 2 AppendEntries RPC 5
+            committed_idx_before := rf.committed_idx
+            if args.LeaderCommit > rf.committed_idx {
+                if args.LeaderCommit < len(rf.log) {
+                    rf.committed_idx = args.LeaderCommit
+                } else {
+                    rf.committed_idx = len(rf.log)
+                }
+            }
+            if committed_idx_before < rf.committed_idx {
+                go func() {
+                    rf.raft_applied_sigal <- true
+                }()
+            }
         }
     }
-    // reset election timeout
     rf.mu.Unlock()
-    rf.ResetTimer(false)
 }
+
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
     ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
     return ok
 }
 
-func (rf *Raft) HeartbeatHandler(server int) {
+func (rf *Raft) CheckPeerCommitIdx() {
     rf.mu.Lock()
-    // check raft state
-    if rf.raft_state != 2 {
-        return
+    tmp_list := make([]int, len(rf.match_idx))
+    copy(tmp_list, rf.match_idx)
+    tmp_list[rf.me] = len(rf.log)
+    sort.Ints(tmp_list)
+    N := tmp_list[len(rf.peers)/2]
+    //DPrintf(fmt.Sprintf("%v: tmp %v N %v c_idx %v", rf.me, tmp_list, N, rf.committed_idx))
+    if N > rf.committed_idx && rf.log[N-1].Term == rf.cur_term {
+        rf.committed_idx = N
+        go func() {
+            rf.raft_applied_sigal <- true
+        }()
     }
-
-    PrevLogIndex := rf.next_idx[server]-1
-    var PrevLogTerm int
-    if PrevLogIndex == 0 {
-        PrevLogTerm = 0
-    } else {
-        PrevLogTerm = rf.log[PrevLogIndex-1].Term
-    }
-    // Figure 2 Leaders Rulls 3
-    var send_logs []LogEntry
-    if len(rf.log) >= rf.next_idx[server] {
-        for idx := rf.next_idx[server]-1; idx < len(rf.log); idx++ {
-            send_logs = append(send_logs, rf.log[idx])
-        }
-    }
-    args := AppendEntriesArgs {rf.cur_term, rf.me, PrevLogIndex, PrevLogTerm, send_logs, rf.committed_idx}
-    reply := AppendEntriesReply {-1, false}
-    rf.raft_logger.Println("Leader Send To", server, "next", rf.next_idx, "match", rf.match_idx)
-    rf.mu.Unlock()
-    if !rf.sendAppendEntries(server, &args, &reply) {
-        return
-    }
-    // Figure 2 Leaders Rules 3.1
-    if reply.Success {
-        rf.mu.Lock()
-        // use PrevLogIndex is perferred
-        rf.next_idx[server] = PrevLogIndex + len(send_logs) + 1
-        rf.match_idx[server] = PrevLogIndex + len(send_logs)
-
-        // Figure 2 Leader Rulls 4
-        committed_idx_before := rf.committed_idx + 1
-        N := rf.committed_idx + 1
-        for N <= len(rf.log) {
-            if rf.log[N-1].Term == rf.cur_term {
-                // include leader itself
-                idx_cnt := 1
-                for each_idx := range rf.match_idx {
-                    if rf.match_idx[each_idx] >= N {
-                        idx_cnt++
-                    }
-                }
-                if idx_cnt > len(rf.peers) / 2 {
-                    rf.raft_logger.Println("Update Committed", N, "in", idx_cnt, "of", len(rf.peers))
-                    rf.committed_idx = N
-                } else {
-                    rf.raft_logger.Println("Update Failed", N, "in", idx_cnt, "of", len(rf.peers))
-                    break
-                }
-            }
-            N++
-        }
-        rf.lastapplied = rf.committed_idx
-
-        if committed_idx_before != 0 && rf.committed_idx != 0 {
-            // send back newly commited msg
-            var apply_msg_array []ApplyMsg
-            for idx := committed_idx_before; idx <= rf.committed_idx; idx++ {
-                each_apply_msg := ApplyMsg {idx, rf.log[idx-1].Command, false, nil}
-                apply_msg_array = append(apply_msg_array, each_apply_msg)
-            }
-            //rf.mu.Unlock()
-            go rf.ClientFeedback(apply_msg_array)
-            //rf.mu.Lock()
-        }
-        //rf.mu.Lock()
-        //rf.raft_logger.Println("Leader Log", rf.log, "next", rf.next_idx, "match", rf.match_idx)
-        rf.mu.Unlock()
-    } else {
-        rf.mu.Lock()
-        // Figure 2 All Servers Rules 2
-        if reply.CurrentTerm > rf.cur_term {
-            rf.cur_term = reply.CurrentTerm
-            rf.raft_state = 0
-            rf.voted_for = -1
-        // Figure 2 Leaders Rules 3.2
-        } else {
-            rf.next_idx[server]--
-        }
-        rf.mu.Unlock()
-    }
-
+    rf.mu.Unlock() 
 }
 
-func (rf *Raft) ElectionHandler(server int) {
-    rf.mu.Lock()
-    // check the raft state
-    if rf.raft_state == 2 {
-        rf.mu.Unlock()
-        return
-    }
-    args := RequestVoteArgs{
-        Term: rf.cur_term, 
-        CandidateId: rf.me,
-        LastLogIndex: len(rf.log),
-        LastLogTerm: -1}
-    reply := RequestVoteReply{
-        CurrentTerm: -1, 
-        VoteGranted: false}
-    if args.LastLogIndex != 0 {
-        args.LastLogTerm = rf.log[args.LastLogIndex-1].Term
-    }
-    rf.mu.Unlock()
-    if !rf.sendRequestVote(server, &args, &reply) {
-        return
-    }
-    rf.mu.Lock()
-    // Figure 2 All Servers Rules 2
-    if reply.CurrentTerm > rf.cur_term {
-        rf.cur_term = reply.CurrentTerm
-        rf.raft_state = 0
-        rf.voted_for = -1
-        rf.mu.Unlock()
-        rf.ResetTimer(false)
-        return
-    }
-    if rf.raft_state == 1 && reply.VoteGranted {
-        rf.vote_received++
-        // win the election 
-        if rf.vote_received > len(rf.peers) / 2 {
-            rf.raft_state = 2
-            rf.raft_logger.Println("ElectionHandler: Win the Election", rf.vote_received, "out of", len(rf.peers))
-            // reset two log slice
-            rf.match_idx = make([]int, len(rf.peers))
-            rf.next_idx = make([]int, len(rf.peers))
-            for idx := 0; idx < len(rf.peers); idx++ {
-                rf.next_idx[idx] = len(rf.log) + 1
-                // todo after relection
-                rf.match_idx[idx] = 0
-            }
-            rf.mu.Unlock()
-            // Figure 2 Leaders Rulls 1
-            // kick off the initial round of heartbeat PRC
-            for idx := 0; idx < len(rf.peers); idx++ {
-                    if idx == rf.me {
-                        continue
-                    }
-                    go rf.HeartbeatHandler(idx)
-                }
-            // reset a heartbeat timer for leader
-            rf.ResetTimer(true)
-            rf.mu.Lock()
-        }
-    }
-    rf.mu.Unlock()
-    /*
-    // received peers' vote
-    if reply.VoteGranted {
-        rf.mu.Lock()
-        rf.vote_received++
-        // win the election 
-        if rf.vote_received > len(rf.peers) / 2 && rf.raft_state == 1{
-            rf.raft_state = 2
-            rf.raft_logger.Println("ElectionHandler: Win the Election", rf.vote_received, "out of", len(rf.peers))
-            // reset two log slice
-            rf.match_idx = make([]int, len(rf.peers))
-            rf.next_idx = make([]int, len(rf.peers))
-            for idx := 0; idx < len(rf.peers); idx++ {
-                rf.next_idx[idx] = len(rf.log) + 1
-                // todo after relection
-                rf.match_idx[idx] = 0
-            }
-            // reset a heartbeat timer for leader
-            rf.mu.Unlock()
-            // Figure 2 Leaders Rulls 1
-            // kick off the initial round of heartbeat PRC
-            for idx := 0; idx < len(rf.peers); idx++ {
-                if idx == rf.me {
-                    continue
-                }
-                go rf.HeartbeatHandler(idx)
-            }
-            rf.ResetTimer(true)
-        } else {
-            // do not win, simply unlock 
-            rf.mu.Unlock()
-        }
-    // request vote failed
-    } else {
-        rf.mu.Lock()
-        if reply.CurrentTerm > rf.cur_term {
-            rf.cur_term = reply.CurrentTerm
-            rf.raft_state = 0
-        }
-        rf.mu.Unlock()
-    }*/
-}
-
-func (rf *Raft) TimerHandler() {
-    rf.mu.Lock()
-
-    // time out as follower state or candidate state
-    if rf.raft_state == 0 || rf.raft_state == 1 {
-        rf.raft_logger.Println("TimerHandler: Election Time Out in term", rf.cur_term)
-        // convert follwer to candidate
-        rf.raft_state = 1
-        // increase term
-        rf.cur_term++
-        // vote for itself
-        rf.vote_received = 1
-        rf.voted_for = rf.me
-        rf.mu.Unlock()
-
-        // send RequestVote to peers in parallel
-        for idx := 0; idx < len(rf.peers); idx++ {
-            if idx == rf.me {
-                continue
-            }
-            // send out RPC in goroutine
-            go rf.ElectionHandler(idx)
-        }
-        // Set Timer for Election Timeout
-        rf.ResetTimer(false) 
-    } else if rf.raft_state == 2 {
-        // timeout as Leader, send out heart beat PRC
-        rf.mu.Unlock()
-        for idx := 0; idx < len(rf.peers); idx++ {
-            if idx == rf.me {
-                continue
-            }
-            go rf.HeartbeatHandler(idx)
-        }
-        rf.ResetTimer(true) 
-    }
-}
-
-func (rf *Raft) ResetTimer(is_heartbeat bool) {
-    rf.mu.Lock()
-    defer rf.mu.Unlock()
-    // need to stop the non-timeout timer firstly    
-    if(rf.raft_timer != nil) {
-        rf.raft_timer.Stop()
-    } 
-    var rand_time_num time.Duration
-    if is_heartbeat {
-        // lab restriction, no more than 10 heartbeats per second
-        rand_time_num = time.Duration(120)
-    } else {
-        // election timeout between 250 ~ 400 ms
-        // larger than paper's 150 ~ 300 ms due to lab restriction
-        rand_time_num = time.Duration(rand.Intn(150) + 250)
-    }
-    // restart the timer for next round timeout
-    rf.raft_timer = time.AfterFunc(time.Millisecond * rand_time_num, rf.TimerHandler);
-}
 //
 // example RequestVote RPC arguments structure.
 // field names must start with capital letters!
@@ -481,45 +389,173 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
     // Your data here (2A).
-    CurrentTerm int   // current term 
+    Term int   // current term 
     VoteGranted bool  // candidate received vote or not
+}
+
+// election part
+
+func (rf *Raft) BroadcastElection() {
+    rf.mu.Lock()
+    if rf.cur_state == 2 {
+        rf.mu.Unlock()
+        return
+    }
+    DPrintf(fmt.Sprintf("%v: Start Election", rf.me))
+    // increase term, vote for itself, convert to candidate
+    rf.cur_term++
+    rf.voted_for = rf.me
+    rf.vote_received = 1
+    rf.cur_state = 1
+
+    // unraced vars
+    size := len(rf.peers)
+    me := rf.me
+    last_log_term := -1
+    last_log_index := len(rf.log)
+    if last_log_index > 0 {
+        last_log_term = rf.log[last_log_index-1].Term
+    }
+    cur_term := rf.cur_term
+    args := RequestVoteArgs{
+        Term: cur_term, 
+        CandidateId: me,
+        LastLogIndex: last_log_index,
+        LastLogTerm: last_log_term}
+    rf.mu.Unlock()
+    // channel waitting for vote result
+    // -2 timeout, -1: stop, 0: reject, 1: vote
+    vote_res_channel := make(chan int, size-1)
+    for i := 0; i < size; i++ {
+        if i == me {
+            continue
+        } 
+        go rf.ElectionSender(i, args, vote_res_channel)
+    }
+    rf.ElectionResHandler(cur_term, vote_res_channel)
+}
+
+func (rf *Raft) ElectionSender(server_idx int, args RequestVoteArgs, vote_res_channel chan int) {
+    reply := RequestVoteReply{
+        Term: -1, 
+        VoteGranted: false}
+    is_ok := rf.sendRequestVote(server_idx, &args, &reply)
+    rf.mu.Lock()
+    // handle response
+    if rf.cur_term != args.Term {
+        // outdated, stop election
+        vote_res_channel <- -1
+        rf.mu.Unlock()
+        return
+    } 
+    if is_ok {
+        if reply.VoteGranted {
+            // get vote
+            vote_res_channel <- 1
+        } else {
+            // All Servers Rules 2
+            if rf.cur_term < reply.Term {
+                rf.cur_term = reply.Term 
+                rf.cur_state = 0
+                rf.ResetTimer(rf.cur_state)
+                vote_res_channel <- -1
+            } else {
+                vote_res_channel <- 0
+            }
+        }
+    } else {
+        // get reply timeout
+        vote_res_channel <- -2
+    }
+    rf.mu.Unlock()
+}
+
+func (rf *Raft) ElectionResHandler(sender_cur_term int, vote_res_channel chan int) {
+    // this node itself
+    vote_cnt := 1
+    reject_cnt := 1
+    is_finish := false
+    for !is_finish {
+        vote_res := <-vote_res_channel
+        rf.mu.Lock()
+        // term changed between RequestVote period
+        if sender_cur_term != rf.cur_term {
+            is_finish = true
+            rf.mu.Unlock()
+            continue
+        } 
+        // handle the vote res
+        if vote_res == 1 {
+            vote_cnt++
+            if vote_cnt >= len(rf.peers)/2 + 1 {
+                DPrintf(fmt.Sprintf("%v: Win Election", rf.me))
+                rf.cur_state = 2
+                for i := 0; i < len(rf.peers); i++ {
+                    rf.next_idx[i] = len(rf.log) + 1
+                    // TODO is 0 right?
+                    rf.match_idx[i] = 0
+                }
+                // boardcast heartbeats
+                go rf.BoardcastHeartbeat()
+                rf.ResetTimer(rf.cur_state)
+                is_finish = true
+            }
+        } else if vote_res == 0 || vote_res == -2 {
+            reject_cnt++
+            if reject_cnt >= len(rf.peers)/2 + 1 {
+                rf.cur_state = 0
+                rf.ResetTimer(rf.cur_state)
+                is_finish = true
+            }
+        } else {
+            // receive stop from channel, stop the loop
+            is_finish = true
+        }
+        rf.mu.Unlock()
+    }
 }
 
 //
 // example RequestVote RPC handler.
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
-    // Your code here (2A, 2B).
+    CheckLogUpToDate := func (arg_term int, arg_idx int, cur_term int, cur_idx int) bool {
+        if arg_term > cur_term {
+            return true
+        }
+        if arg_term == cur_term && arg_idx >= cur_idx {
+            return true
+        }
+        return false
+    }
     rf.mu.Lock()
-    last_log_index := len(rf.log)
-    last_log_term := -1
-    if last_log_index != 0 {
-        last_log_term = rf.log[last_log_index-1].Term
-    }
-    // Figure 2 All Servers Rules 2
-    if args.Term > rf.cur_term {
-        rf.cur_term = args.Term
-        rf.raft_state = 0
-        rf.voted_for = -1
-    }
+    reply.Term = rf.cur_term
     // Figure 2 RequestVote RPC Rules 1
     if args.Term < rf.cur_term {
-        reply.CurrentTerm = rf.cur_term
         reply.VoteGranted = false
-    // Figure 2 RequestVote RPC Rules 2
-    } else if rf.voted_for == -1 && (args.LastLogTerm >= last_log_term || (args.LastLogTerm == last_log_term && args.LastLogIndex >= last_log_index)) {
-        // has not voted for other peer or itself
-        rf.voted_for = args.CandidateId
-        rf.cur_term = args.Term
-        reply.CurrentTerm = args.Term
-        reply.VoteGranted = true
-        // reset timer for election timeout
-        rf.mu.Unlock()
-        rf.ResetTimer(false)
-        rf.mu.Lock()
     } else {
-        reply.CurrentTerm = rf.cur_term
-        reply.VoteGranted = false
+        // Figure 2 All Servers Rules 2
+        if args.Term > rf.cur_term {
+            rf.cur_term = args.Term
+            rf.voted_for = -1
+            rf.cur_state = 0
+        }
+        last_log_term := -1
+        last_log_index := len(rf.log)
+        if last_log_index > 0 {
+            last_log_term = rf.log[last_log_index-1].Term
+        }
+        // Figure 2 RequestVote RPC Rules 2
+        if (rf.voted_for == -1 || rf.voted_for == args.CandidateId) && 
+            CheckLogUpToDate(args.LastLogTerm, args.LastLogIndex, last_log_term, last_log_index) {
+            reply.VoteGranted = true
+            //DPrintf(fmt.Sprintf("%v: Vote %v : %v, %v : %v", rf.me, last_log_term, last_log_index, args.LastLogTerm, args.LastLogIndex))
+            rf.cur_state = 0
+            rf.voted_for = args.CandidateId
+            rf.ResetTimer(rf.cur_state)
+        } else {
+            reply.VoteGranted = false
+        }
     }
     rf.mu.Unlock()
 }
@@ -578,7 +614,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
     isLeader := true
     rf.mu.Lock()
     // to check is raft a leader
-    if rf.raft_state != 2 {
+    if rf.cur_state != 2 {
         isLeader = false
         rf.mu.Unlock()
         return index, term, isLeader
@@ -589,8 +625,11 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
     rf.log = append(rf.log, new_log_entry)
     index = len(rf.log)
     term = rf.cur_term
+    rf.ResetTimer(rf.cur_state)
+    //go rf.BoardcastHeartbeat()
+    DPrintf(fmt.Sprintf("%v: Called %v", rf.me, new_log_entry))
     // Your code here (2B).
-    rf.raft_logger.Println("Start: Called", command, "in term", rf.cur_term)
+    //rf.raft_logger.Println("Start: Called", command, "in term", rf.cur_term)
     rf.mu.Unlock()
     return index, term, isLeader
 }
@@ -624,14 +663,14 @@ func Make(peers []*labrpc.ClientEnd, me int,
     rf.persister = persister
     rf.me = me
     // starts with term 0 and follower state
+    rf.cur_state = 0
     rf.cur_term = 0
-    rf.raft_state = 0
-
-    rf.raft_timer = nil
     rf.voted_for = -1
 
+    rf.vote_received = 0
+
     rf.committed_idx = 0
-    rf.lastapplied = 0
+    rf.last_applied_idx = 0
 
     rf.match_idx = make([]int, len(peers))
     rf.next_idx = make([]int, len(peers))
@@ -640,17 +679,18 @@ func Make(peers []*labrpc.ClientEnd, me int,
         rf.match_idx[idx] = 0
     }
 
-    rf.raft_logger = log.New(os.Stdout, strconv.Itoa(rf.me) + " Logger: ", log.Lshortfile|log.Lmicroseconds)
-    // Your initialization code here (2A, 2B, 2C).
+    // set the seed once for each raft node
+    rand.Seed(time.Now().UnixNano() + int64(me))
+    rf.raft_timer = time.NewTimer(GetRandomTime(rf.cur_state))
+    // start background timer
+    go rf.NodeTimer()
 
+    rf.raft_apply_ch = applyCh
+    rf.raft_applied_sigal = make(chan bool)
+    go rf.ApplyMessage()
     // initialize from state persisted before a crash
     rf.readPersist(persister.ReadRaftState())
 
-    // set the seed once for each raft node
-    rand.Seed(time.Now().UnixNano() + int64(me))  
-    // reset timer for inital timeout
-    rf.ResetTimer(false)
-    rf.raft_applych = &applyCh
     return rf
 }
 
