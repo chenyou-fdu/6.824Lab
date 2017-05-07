@@ -26,6 +26,8 @@ import (
     "math/rand"
     "log"
     "sort"
+    "encoding/gob"
+    "bytes"
     //"os"
     //"strconv"
 )
@@ -160,6 +162,13 @@ func (rf *Raft) GetState() (int, bool) {
 //
 func (rf *Raft) persist() {
     // Your code here (2C).
+    w := new(bytes.Buffer)
+    e := gob.NewEncoder(w)
+    e.Encode(rf.cur_term)
+    e.Encode(rf.voted_for)
+    e.Encode(rf.log)
+    data := w.Bytes()
+    rf.persister.SaveRaftState(data)
     // Example:
     // w := new(bytes.Buffer)
     // e := gob.NewEncoder(w)
@@ -182,6 +191,11 @@ func (rf *Raft) readPersist(data []byte) {
     if data == nil || len(data) < 1 { // bootstrap without any state?
         return
     }
+    r := bytes.NewBuffer(data)
+    d := gob.NewDecoder(r)
+    d.Decode(&rf.cur_term)
+    d.Decode(&rf.voted_for)
+    d.Decode(&rf.log)
 }
 
 type AppendEntriesArgs struct {
@@ -248,25 +262,19 @@ func (rf *Raft) HeartbeatSender(server_idx int, args AppendEntriesArgs) {
                 rf.cur_state = 0
                 rf.cur_term = reply.Term
                 rf.voted_for = -1
+                rf.persist()
             } else {
-                DPrintf(fmt.Sprintf("%v: Conflict %v", rf.me, reply))
-                /*prev_log_index := -1
-                
-                for i := args.PrevLogIndex - 1; i >= 0; i-- {
-                    if rf.log[i].Term == reply.ConflictTerm {
-                        prev_log_index = i+1
-                        break
-                    }
-                }
-                if prev_log_index > 0 && rf.log[prev_log_index-1].Term != reply.ConflictTerm {
-                    prev_log_index = reply.ConflictIndex - 1
-                }*/
-                rf.next_idx[server_idx]--
+                DPrintf(fmt.Sprintf("%v: Conflict %v", rf.me, reply.ConflictIndex))
+                rf.next_idx[server_idx] = reply.ConflictIndex
                 prev_log_index := rf.next_idx[server_idx] - 1 
                 
                 prev_log_term := -1
                 if prev_log_index > 0 {
                     prev_log_term = rf.log[prev_log_index-1].Term
+                }
+                var retry_entries []LogEntry
+                if rf.next_idx[server_idx] > 0 {
+                    retry_entries = rf.log[rf.next_idx[server_idx]-1:]
                 }
                 retry_args := AppendEntriesArgs {
                     Term: rf.cur_term,
@@ -274,7 +282,7 @@ func (rf *Raft) HeartbeatSender(server_idx int, args AppendEntriesArgs) {
                     PrevLogIndex: prev_log_index,
                     PrevLogTerm: prev_log_term,
                     //Entries: rf.log[args.PrevLogIndex+1-1:],
-                    Entries: rf.log[rf.next_idx[server_idx]-1:],
+                    Entries: retry_entries,//rf.log[rf.next_idx[server_idx]-1:],
                     LeaderCommit: rf.committed_idx }
                 go rf.HeartbeatSender(server_idx, retry_args)
             }
@@ -298,20 +306,21 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
         if rf.cur_term < args.Term {
             rf.voted_for = -1
             rf.cur_term = args.Term
+            rf.persist()
         }
-        // Figure 2 AppendEntries RPC 2
-        if args.PrevLogIndex > len(rf.log) {
-            reply.Success = false
-            reply.ConflictTerm = -1
-            reply.ConflictIndex = len(rf.log) + 1
-        // Figure 2 AppendEntries RPC 3, check is PrevLogIndex equalls zero for first entry
-        } else if args.PrevLogIndex > 0 && args.PrevLogTerm != rf.log[args.PrevLogIndex-1].Term {
-            reply.Success = false
-            reply.ConflictTerm = rf.log[args.PrevLogIndex-1].Term
-            reply.ConflictIndex = args.PrevLogIndex
-            for reply.ConflictIndex > 0 && rf.log[reply.ConflictIndex - 1].Term == reply.ConflictTerm {
-                reply.ConflictIndex--
+        // Figure 2 AppendEntries RPC 2 & 3
+        if args.PrevLogIndex > 0 && (args.PrevLogIndex > len(rf.log) || args.PrevLogTerm != rf.log[args.PrevLogIndex-1].Term) {
+            reply.ConflictIndex = len(rf.log)
+            if args.PrevLogIndex < len(rf.log) {
+                reply.ConflictIndex = args.PrevLogIndex
+                for reply.ConflictIndex > 0 {
+                    if rf.log[reply.ConflictIndex-1].Term != args.PrevLogTerm {
+                        break
+                    }
+                    reply.ConflictIndex--
+                }
             }
+            reply.Success = false
         } else {
             reply.Success = true
             entry_start_idx := 0
@@ -328,6 +337,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
                 for i := entry_start_idx; i < len(args.Entries); i++ {
                     rf.log = append(rf.log, args.Entries[i])
                 }
+                rf.persist()
             }
             // Figure 2 AppendEntries RPC 5
             committed_idx_before := rf.committed_idx
@@ -407,7 +417,7 @@ func (rf *Raft) BroadcastElection() {
     rf.voted_for = rf.me
     rf.vote_received = 1
     rf.cur_state = 1
-
+    rf.persist()
     // unraced vars
     size := len(rf.peers)
     me := rf.me
@@ -457,6 +467,7 @@ func (rf *Raft) ElectionSender(server_idx int, args RequestVoteArgs, vote_res_ch
             if rf.cur_term < reply.Term {
                 rf.cur_term = reply.Term 
                 rf.cur_state = 0
+                rf.persist()
                 rf.ResetTimer(rf.cur_state)
                 vote_res_channel <- -1
             } else {
@@ -492,7 +503,6 @@ func (rf *Raft) ElectionResHandler(sender_cur_term int, vote_res_channel chan in
                 rf.cur_state = 2
                 for i := 0; i < len(rf.peers); i++ {
                     rf.next_idx[i] = len(rf.log) + 1
-                    // TODO is 0 right?
                     rf.match_idx[i] = 0
                 }
                 // boardcast heartbeats
@@ -539,6 +549,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
             rf.cur_term = args.Term
             rf.voted_for = -1
             rf.cur_state = 0
+            rf.persist()
         }
         last_log_term := -1
         last_log_index := len(rf.log)
@@ -552,6 +563,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
             //DPrintf(fmt.Sprintf("%v: Vote %v : %v, %v : %v", rf.me, last_log_term, last_log_index, args.LastLogTerm, args.LastLogIndex))
             rf.cur_state = 0
             rf.voted_for = args.CandidateId
+            rf.persist()
             rf.ResetTimer(rf.cur_state)
         } else {
             reply.VoteGranted = false
@@ -626,10 +638,12 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
     index = len(rf.log)
     term = rf.cur_term
     rf.ResetTimer(rf.cur_state)
-    //go rf.BoardcastHeartbeat()
+
+    rf.persist()
+    
+    go rf.BoardcastHeartbeat()
     DPrintf(fmt.Sprintf("%v: Called %v", rf.me, new_log_entry))
     // Your code here (2B).
-    //rf.raft_logger.Println("Start: Called", command, "in term", rf.cur_term)
     rf.mu.Unlock()
     return index, term, isLeader
 }
