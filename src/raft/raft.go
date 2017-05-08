@@ -242,8 +242,7 @@ func (rf *Raft) BoardcastHeartbeat() {
 }
 
 func (rf *Raft) HeartbeatSender(server_idx int, args AppendEntriesArgs) {
-    //DPrintf(fmt.Sprintf("%v: Send Out heartbeats to %v next %v match %v", rf.me, server_idx, rf.next_idx, rf.match_idx))
-    DPrintf(fmt.Sprintf("%v: Send Out heartbeats to %v log %v", rf.me, server_idx, rf.log))
+    DPrintf(fmt.Sprintf("%v: Send Out heartbeats to %v", rf.me, server_idx))
     reply := AppendEntriesReply {-1, -1, -1, false}
     is_ok := rf.sendAppendEntries(server_idx, &args, &reply)
     rf.mu.Lock()
@@ -293,7 +292,7 @@ func (rf *Raft) HeartbeatSender(server_idx int, args AppendEntriesArgs) {
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
     rf.mu.Lock()
-    DPrintf(fmt.Sprintf("%v: Receive heartbeat with %v log %v", rf.me, args, rf.log))
+    DPrintf(fmt.Sprintf("%v: Receive heartbeat with %v", rf.me, args))
     reply.Term = rf.cur_term
 
     // Figure 2 AppendEntries RPC 1
@@ -337,7 +336,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
                 for i := entry_start_idx; i < len(args.Entries); i++ {
                     rf.log = append(rf.log, args.Entries[i])
                 }
-                rf.persist()
+                if entry_start_idx < len(args.Entries) {
+                    rf.persist()
+                }
             }
             // Figure 2 AppendEntries RPC 5
             committed_idx_before := rf.committed_idx
@@ -549,7 +550,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
             rf.cur_term = args.Term
             rf.voted_for = -1
             rf.cur_state = 0
-            rf.persist()
         }
         last_log_term := -1
         last_log_index := len(rf.log)
@@ -563,10 +563,13 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
             //DPrintf(fmt.Sprintf("%v: Vote %v : %v, %v : %v", rf.me, last_log_term, last_log_index, args.LastLogTerm, args.LastLogIndex))
             rf.cur_state = 0
             rf.voted_for = args.CandidateId
-            rf.persist()
             rf.ResetTimer(rf.cur_state)
         } else {
             reply.VoteGranted = false
+        }
+        if reply.VoteGranted || args.Term > rf.cur_term {
+            rf.cur_state = 0
+            rf.persist()
         }
     }
     rf.mu.Unlock()
@@ -656,6 +659,9 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 //
 func (rf *Raft) Kill() {
     // Your code here, if desired.
+    rf.mu.Lock()
+    rf.persist()
+    rf.mu.Unlock()
 }
 
 //
